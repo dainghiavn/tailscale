@@ -1,17 +1,19 @@
-# Tailscale Proxmox Installer
+# Tailscale Installer
 
-> Cài đặt Tailscale tự động vào LXC container trên Proxmox VE  
-> Tích hợp **Preflight Scan** — phân tích mạng và đưa ra khuyến nghị trước khi cài
+> Cài đặt Tailscale tự động — **tự detect môi trường** và điều chỉnh theo  
+> Tích hợp **Preflight Scan** — phân tích mạng, đưa ra khuyến nghị trước khi cài
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Proxmox VE](https://img.shields.io/badge/Proxmox%20VE-7.0%2B-orange)](https://www.proxmox.com)
 [![Tailscale](https://img.shields.io/badge/Tailscale-latest-blue)](https://tailscale.com)
+[![Ubuntu](https://img.shields.io/badge/Ubuntu-20.04%2B-E95420)](https://ubuntu.com)
+[![Debian](https://img.shields.io/badge/Debian-11%2B-A81D33)](https://debian.org)
 
 ---
 
 ## 📋 Mục lục
 
-- [Yêu cầu](#-yêu-cầu)
+- [Hỗ trợ môi trường](#-hỗ-trợ-môi-trường)
 - [Cài đặt nhanh](#-cài-đặt-nhanh)
 - [Tính năng](#-tính-năng)
 - [Preflight Scan](#-preflight-scan)
@@ -26,74 +28,96 @@
 
 ---
 
-## ✅ Yêu cầu
+## 🖥️ Hỗ trợ môi trường
 
-| Yêu cầu | Tối thiểu |
-|---|---|
-| Proxmox VE | 7.0+ |
-| OS LXC | Debian 12 (mặc định) |
-| RAM host | 256MB free |
-| Disk | 2GB free trên storage |
-| Internet | HTTPS outbound bắt buộc |
-| Quyền | root trên Proxmox host |
+Script **tự động detect** môi trường và cài đặt phù hợp — **1 lệnh duy nhất** cho tất cả:
+
+| Môi trường | Detect | Hành động |
+|---|---|---|
+| **Proxmox VE host** | `pveversion` | Tạo LXC mới → Cài Tailscale bên trong |
+| **LXC container** | `/proc/1/environ` | Cài Tailscale trực tiếp vào container |
+| **Ubuntu Server** | `OS_ID=ubuntu` | Cài Tailscale trực tiếp |
+| **Debian standalone** | `OS_ID=debian` | Cài Tailscale trực tiếp |
+| **Raspberry Pi** | `/proc/device-tree/model` | Cài + kiểm tra TUN module |
+| **VPS / Cloud** | DMI + cloud-init | Cài + cảnh báo UDP outbound |
+| **Docker host** | `docker daemon` | Cài + cảnh báo routing conflict |
+
+### Yêu cầu theo môi trường
+
+| | Proxmox host | Linux standalone |
+|---|---|---|
+| OS | Proxmox VE 7.0+ | Debian 11+ / Ubuntu 20.04+ |
+| RAM | 256MB free | 128MB free |
+| Disk | 2GB free (cho LXC) | 512MB free |
+| Internet | HTTPS outbound | HTTPS outbound |
+| Quyền | root | root |
 
 ---
 
 ## 🚀 Cài đặt nhanh
 
-Chạy lệnh sau trên **Proxmox VE shell**:
+**1 lệnh — chạy được mọi nơi:**
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/dainghiavn/tailscale/main/ct/tailscale.sh)"
 ```
 
-> ⚠️ **Lưu ý:** Chạy trên Proxmox host shell — không phải bên trong LXC
+Script tự detect môi trường và chạy đúng flow phù hợp.
 
 ---
 
 ## ✨ Tính năng
 
+### Auto Environment Detection
+- Tự nhận biết: **Proxmox host / LXC / Ubuntu / Debian / Raspberry Pi / VPS / Docker**
+- Điều chỉnh preflight, menu và flow cài đặt theo từng môi trường
+- Cảnh báo đặc thù: Docker routing conflict, RPi TUN module, VPS UDP block
+
 ### Preflight Scan thông minh
 - Kiểm tra **5 nhóm** trước khi cài: System, Network, UDP/NAT, Tailscale, Security
-- Phát hiện **NAT type** và dự đoán chất lượng kết nối P2P
-- Đưa ra **khuyến nghị cụ thể** theo tình trạng hệ thống
-- Cho phép **Re-scan** sau khi kỹ thuật viên tự xử lý
+- Phát hiện **NAT type** — dự đoán chất lượng kết nối P2P
+- Đưa ra **khuyến nghị cụ thể** theo tình trạng thực tế
+- Cho phép **Re-scan** sau khi kỹ thuật viên tự xử lý network
 
 ### Dynamic Menu
-- **Chưa cài:** Menu Simple / Advanced
-- **Đã cài:** Menu Add-Remove / Update / Re-auth / Uninstall
-- Không hiển thị tùy chọn không phù hợp với trạng thái hiện tại
+- **Chưa cài:** Simple / Advanced
+- **Đã cài:** Add-Remove / Update / Re-auth / Uninstall
+- Tự ẩn/hiện tùy chọn theo trạng thái hiện tại
 
-### LXC Isolated
+### LXC Isolated (Proxmox mode)
 - Luôn tạo **LXC mới** — không cài chung với service khác
 - Tự động inject **TUN device** vào LXC config
 - Hỗ trợ **Unprivileged LXC** (bảo mật tốt hơn)
+- Resource tối thiểu: ~64MB RAM, ~300MB disk khi idle
 
-### Chế độ kết nối
+### Chế độ kết nối Tailscale
 | Mode | Điều kiện | Latency |
 |---|---|---|
-| 🟢 Direct P2P | UDP 41641 open + NAT tốt | < 10ms |
-| 🟡 Hybrid | UDP partial hoặc NAT restricted | Không ổn định |
-| 🔴 DERP Only | UDP blocked hoặc Symmetric NAT | 80-200ms |
+| 🟢 Direct P2P | UDP 41641 open + NAT Full/Restricted | < 10ms |
+| 🟡 Hybrid | UDP partial / NAT Port-Restricted | Không ổn định |
+| 🔴 DERP Only | UDP blocked / Symmetric NAT | 80–200ms |
 
 ---
 
 ## 🔍 Preflight Scan
 
-Script thực hiện **5 nhóm kiểm tra** và in báo cáo trước khi cài:
+Script thực hiện **5 nhóm kiểm tra** và in báo cáo trước khi cài.
 
+### Proxmox mode
 ```
-── ① SYSTEM ────────────────────────────────────────
+── ① SYSTEM (Proxmox) ──────────────────────────────
 [✓] Proxmox VE 8.2.4         OK
 [✓] Disk: 48GB free           OK  (cần 2GB)
 [✓] CT ID 200                 OK  (chưa dùng)
 [⚠] RAM: 380MB free          WARN (khuyến nghị 512MB+)
+[✓] Template debian-12        OK
 
 ── ② NETWORK ───────────────────────────────────────
 [✓] Gateway: 192.168.1.1     OK
 [✓] DNS resolve               OK
 [✓] HTTPS controlplane        OK
 [ℹ] Hop count: 3 hops        INFO (có firewall trung gian)
+[ℹ] External IP: 203.x.x.x  INFO
 
 ── ③ UDP / NAT ─────────────────────────────────────
 [✗] UDP 41641                 BLOCKED ← firewall chặn
@@ -101,57 +125,65 @@ Script thực hiện **5 nhóm kiểm tra** và in báo cáo trước khi cài:
 [✓] TCP 443 DERP fallback     OK
 
 ── ④ TAILSCALE ─────────────────────────────────────
-[✓] Chưa cài                  Fresh install mode
+[✓] Chưa cài trong LXC nào   Fresh install mode
 
 ── ⑤ SECURITY ──────────────────────────────────────
-[✓] Unprivileged LXC          OK
+[✓] Unprivileged LXC mode     OK
+[ℹ] ip_forward: disabled     INFO (sẽ enable nếu cần)
 [ℹ] Proxmox Firewall: ON     INFO (cần thêm rule UDP 41641)
+```
+
+### Standalone mode (Ubuntu/Debian/RPi/VPS/Docker)
+```
+── ① SYSTEM ────────────────────────────────────────
+[✓] OS: ubuntu 22.04 jammy    OK
+[✓] Architecture: x86_64      OK
+[✓] Disk: 12GB free           OK
+[✓] systemd: 249              OK
+[✓] TUN device: /dev/net/tun  OK
+
+── ② NETWORK / ③ UDP/NAT / ④ TAILSCALE / ⑤ SECURITY
+    (tương tự — nhưng không check PVE/storage/CT ID)
 ```
 
 ### Verdict 4 cấp
 
 | Verdict | Điều kiện | Hành động |
 |---|---|---|
-| 🟢 **GO** | Score cao, không có lỗi | Tiếp tục cài ngay |
-| 🟡 **WARN** | Có vấn đề nhỏ | Hỏi C/R/E (Continue/Rescan/Exit) |
-| 🔴 **STOP** | Vấn đề nghiêm trọng | Yêu cầu gõ `FORCE` để bỏ qua |
-| ⛔ **ABORT** | Lỗi critical | Tự động dừng, không có option |
+| 🟢 **GO** | Score tốt, không có lỗi | Tiếp tục ngay |
+| 🟡 **WARN** | Có vấn đề nhỏ | Hỏi **C**ontinue / **R**escan / **E**xit |
+| 🔴 **STOP** | Vấn đề nghiêm trọng | Phải gõ `FORCE` để bỏ qua |
+| ⛔ **ABORT** | Lỗi critical | Tự dừng — không có option tiếp tục |
 
 ---
 
 ## 📦 Chế độ cài đặt
 
 ### Simple Mode
-Cài đặt cơ bản — kết nối vào tailnet, auth thủ công sau.
-
 ```
 ✓ Cài Tailscale package
 ✓ Start tailscaled service
-✓ Inject TUN device
+✓ Inject TUN device (Proxmox mode)
 ✓ Hướng dẫn tailscale up
 ```
 
 ### Advanced Mode
-Đầy đủ tùy chọn cho môi trường phức tạp.
-
 ```
 ✓ Tất cả của Simple
 + Subnet Router  — expose LAN nội bộ vào tailnet
-+ Exit Node      — route internet traffic qua LXC
++ Exit Node      — route internet traffic qua máy này
 + Tailscale SSH  — quản lý SSH qua tailnet
-+ Auth Key       — authenticate tự động (không cần thủ công)
-+ ip_forward     — tự động enable khi cần
++ Auth Key       — authenticate tự động
++ ip_forward     — enable khi cần
 + iptables rules — persist sau reboot
 ```
 
-### Manage Mode (đã cài)
-Xuất hiện khi phát hiện Tailscale đã được cài trong LXC.
-
+### Manage Mode (khi đã cài)
 ```
 [M] Add/Remove features  — toggle Subnet/ExitNode/SSH
 [U] Update               — apt upgrade tailscale
 [R] Re-authenticate      — khi auth key hết hạn
-[X] Uninstall            — gỡ sạch, revert TUN config
+[X] Uninstall            — gỡ sạch
 ```
 
 ---
@@ -161,18 +193,18 @@ Xuất hiện khi phát hiện Tailscale đã được cài trong LXC.
 ```
 tailscale/
 ├── ct/
-│   └── tailscale.sh              ← Entry point (chạy trên Proxmox host)
+│   └── tailscale.sh              ← Entry point — chạy mọi môi trường
 ├── install/
-│   └── tailscale-install.sh      ← Install script (chạy bên trong LXC)
+│   └── tailscale-install.sh      ← Install script — chạy trên target machine
 ├── README.md
 └── LICENSE
 ```
 
 ### Dependency
-Script dùng [bash-lib](https://github.com/dainghiavn/bash-lib) — thư viện helper dùng chung:
+Dùng [bash-lib](https://github.com/dainghiavn/bash-lib) — thư viện helper dùng chung:
 
 ```bash
-# Tự động import trong script — không cần làm gì thêm
+# Tự động import — không cần làm gì thêm
 source <(curl -fsSL https://raw.githubusercontent.com/dainghiavn/bash-lib/main/lib.sh)
 ```
 
@@ -181,20 +213,33 @@ source <(curl -fsSL https://raw.githubusercontent.com/dainghiavn/bash-lib/main/l
 ## ⚙️ Cách hoạt động
 
 ```
-Proxmox Host Shell
+bash -c "$(curl ... tailscale.sh)"
 │
 ├─ ct/tailscale.sh
-│   ├── Phase 0: Detect môi trường + check root
-│   ├── Phase 1: Preflight scan (5 nhóm)
-│   ├── Phase 2: Verdict + User decision (C/R/E/FORCE)
+│   ├── Phase 0: detect_environment()
+│   │    ├── Proxmox host  → ENV_MODE=proxmox
+│   │    ├── LXC container → ENV_MODE=lxc
+│   │    └── Linux         → ENV_MODE=standalone
+│   │         └── detect OS: ubuntu|debian|raspberrypi|vps|docker
+│   │
+│   ├── Phase 1: Preflight scan (5 nhóm — theo môi trường)
+│   │    ├── Proxmox → check PVE, storage, CT ID, template
+│   │    └── Other   → check OS, arch, TUN, disk, RAM
+│   │
+│   ├── Phase 2: Verdict (GO/WARN/STOP/ABORT) + User confirm
+│   │
 │   ├── Phase 3: Dynamic menu theo trạng thái
-│   ├── Phase 4: Cấu hình LXC + Advanced options
-│   ├── Phase 5: Tạo LXC → Inject TUN → Start
-│   │            └── gọi install/tailscale-install.sh bên trong LXC
-│   └── Phase 6: Summary + hướng dẫn auth
+│   │
+│   ├── Phase 4: Configure (LXC params nếu Proxmox, Advanced options)
+│   │
+│   ├── Phase 5: Install theo môi trường
+│   │    ├── Proxmox    → tạo LXC → inject TUN → pct_exec_script
+│   │    └── Standalone → export env vars → bash install script trực tiếp
+│   │
+│   └── Phase 6: Summary + auth instructions
 │
-└─ install/tailscale-install.sh (chạy trong LXC)
-    ├── Step 0: Verify LXC environment
+└─ install/tailscale-install.sh (chạy trên target — LXC hoặc máy hiện tại)
+    ├── Step 0: Verify environment (OS, TUN, internet)
     ├── Step 1: apt update + dependencies
     ├── Step 2: Thêm Tailscale repo + cài package
     ├── Step 3: ip_forward + iptables nếu cần
@@ -208,29 +253,33 @@ Proxmox Host Shell
 
 ## 🔐 Sau khi cài
 
-### Auth thủ công (không dùng auth key)
+### Auth thủ công
 
+**Proxmox mode** — vào LXC:
 ```bash
-# Vào LXC
 pct exec <CTID> -- bash
-
-# Simple mode
 tailscale up
+# Mở link hiện ra trên browser
+```
 
-# Advanced mode — ví dụ đầy đủ
+**Standalone mode** — chạy trực tiếp:
+```bash
+tailscale up
+# Mở link hiện ra trên browser
+```
+
+**Advanced mode** — với đầy đủ tùy chọn:
+```bash
 tailscale up \
   --advertise-routes=192.168.1.0/24 \
   --advertise-exit-node \
   --ssh \
   --accept-routes
-
-# Mở link hiện ra trên browser để đăng nhập
 ```
 
 ### Approve trên Admin Console (Advanced mode)
 
-Sau khi auth, vào [Tailscale Admin](https://login.tailscale.com/admin/machines):
-
+Vào [Tailscale Admin](https://login.tailscale.com/admin/machines):
 ```
 Subnet Router → Click "..." → Approve subnet routes
 Exit Node     → Click "..." → Approve as exit node
@@ -239,127 +288,133 @@ Exit Node     → Click "..." → Approve as exit node
 ### Kiểm tra kết nối
 
 ```bash
-# Xem trạng thái
+# Proxmox mode
 pct exec <CTID> -- tailscale status
-
-# Xem IP
-pct exec <CTID> -- tailscale ip
-
-# Kiểm tra network quality
 pct exec <CTID> -- tailscale netcheck
 
-# Debug đầy đủ
-pct exec <CTID> -- tailscale debug report
+# Standalone mode
+tailscale status
+tailscale netcheck
+tailscale debug report
 ```
 
 ---
 
 ## 🛠️ Quản lý sau cài đặt
 
-Chạy lại script để vào menu quản lý:
+Chạy lại script — tự detect đã cài và hiển thị menu quản lý:
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/dainghiavn/tailscale/main/ct/tailscale.sh)"
-```
-
-Script tự động phát hiện Tailscale đã cài và hiển thị menu quản lý.
-
-### Thao tác thủ công trong LXC
-
-```bash
-# Vào LXC shell
-pct exec <CTID> -- bash
-
-# Xem logs
-journalctl -u tailscaled -f
-
-# Restart service
-systemctl restart tailscaled
-
-# Update thủ công
-apt-get update && apt-get install -y tailscale
-
-# Logout khỏi tailnet
-tailscale logout
 ```
 
 ---
 
 ## 🔧 Gỡ lỗi
 
-### UDP 41641 bị chặn
-
-```bash
-# Test từ LXC
-pct exec <CTID> -- bash -c \
-  "echo | nc -u -w3 udp.tailscale.com 41641 && echo OPEN || echo BLOCKED"
-
-# Fix trên Proxmox Firewall
-# Datacenter → Firewall → Add:
-# Direction: out, Protocol: udp, Dest port: 41641, Action: ACCEPT
-```
-
 ### TUN device không có
 
 ```bash
-# Kiểm tra
-pct exec <CTID> -- ls -la /dev/net/tun
+# Standalone / LXC — thử load module
+modprobe tun
+echo 'tun' >> /etc/modules
 
-# Fix thủ công — chạy trên Proxmox host
+# Proxmox — inject vào LXC config
 echo "lxc.cgroup2.devices.allow: c 10:200 rwm" >> /etc/pve/lxc/<CTID>.conf
 echo "lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file" \
   >> /etc/pve/lxc/<CTID>.conf
 pct restart <CTID>
 ```
 
-### Tailscale không start
+### UDP 41641 bị chặn
 
 ```bash
-# Xem logs chi tiết
-pct exec <CTID> -- journalctl -u tailscaled -n 100 --no-pager
+# Test UDP
+echo | nc -u -w3 udp.tailscale.com 41641 && echo OPEN || echo BLOCKED
 
-# Restart
-pct exec <CTID> -- systemctl restart tailscaled
+# Fix Proxmox Firewall
+# Datacenter → Firewall → Add:
+# Direction: out, Protocol: udp, Dest port: 41641, Action: ACCEPT
+```
+
+### Docker host — routing conflict
+
+```bash
+# Xem hướng dẫn chính thức
+# https://tailscale.com/kb/1130/docker
+
+# Disable Docker iptables nếu dùng Tailscale subnet
+# dockerd --iptables=false
+```
+
+### Raspberry Pi — TUN không load
+
+```bash
+# Load TUN module
+modprobe tun
+lsmod | grep tun
+
+# Persist sau reboot
+echo 'tun' >> /etc/modules-load.d/tun.conf
 ```
 
 ### Xem log cài đặt
 
 ```bash
-# Log trên Proxmox host
+# Proxmox host
 ls /var/log/tailscale-proxmox/
 
-# Log trong LXC
-pct exec <CTID> -- ls /var/log/tailscale-lxc-install*.log
+# Standalone / LXC
+ls /var/log/tailscale-lxc-install*.log
+
+# Tailscale service log
+journalctl -u tailscaled -n 100 --no-pager
 ```
 
 ---
 
 ## ❓ FAQ
 
-**Q: Tại sao luôn tạo LXC mới thay vì cài chung?**
+**Q: Tại sao Proxmox mode luôn tạo LXC mới?**
 
-> Cô lập hoàn toàn — nếu có sự cố, chỉ ảnh hưởng đến LXC Tailscale.  
+> Cô lập hoàn toàn — sự cố chỉ ảnh hưởng LXC Tailscale.  
 > TUN device và ip_forward chỉ enable trên đúng 1 container.  
-> Dễ rebuild mà không ảnh hưởng các service khác.  
-> Resource tiêu thụ rất nhỏ: ~64MB RAM, ~300MB disk khi idle.
+> Dễ rebuild không ảnh hưởng service khác.  
+> Resource nhỏ: ~64MB RAM, ~300MB disk idle.
+
+**Q: Standalone mode có khác gì LXC mode không?**
+
+> Standalone cài trực tiếp lên máy hiện tại (Ubuntu/Debian/RPi/VPS).  
+> LXC mode cũng cài trực tiếp nhưng có thêm check TUN từ Proxmox host.  
+> Cả 2 đều dùng cùng `install/tailscale-install.sh`.
+
+**Q: Raspberry Pi có cần config thêm không?**
+
+> Script tự detect RPi và kiểm tra TUN module.  
+> Nếu thiếu: tự chạy `modprobe tun` và hướng dẫn persist.  
+> Hỗ trợ cả armv7l (RPi 3/4 32-bit) và aarch64 (RPi 4/5 64-bit).
+
+**Q: VPS/Cloud có vấn đề gì đặc thù không?**
+
+> Một số provider block UDP outbound → Tailscale sẽ dùng DERP relay.  
+> Script cảnh báo rõ ràng nếu detect VPS và UDP bị block.  
+> Vẫn hoạt động được qua TCP 443 (DERP) dù latency cao hơn.
+
+**Q: Docker host có dùng được không?**
+
+> Được, nhưng cần cẩn thận với iptables và routing.  
+> Script cảnh báo potential conflict với Docker networking.  
+> Xem: [tailscale.com/kb/1130/docker](https://tailscale.com/kb/1130/docker)
 
 **Q: Tailscale DERP relay có an toàn không?**
 
-> Traffic vẫn được **mã hóa end-to-end** (WireGuard) — DERP server không đọc được nội dung.  
-> Chỉ khác là traffic đi qua server trung gian thay vì kết nối trực tiếp → latency cao hơn.
+> Traffic vẫn **mã hóa end-to-end** (WireGuard) — DERP không đọc được nội dung.  
+> Chỉ khác: đi qua relay thay vì kết nối trực tiếp → latency cao hơn.
 
-**Q: Có thể dùng auth key reusable không?**
+**Q: Auth key loại nào nên dùng?**
 
-> Có. Tạo tại [Tailscale Admin → Settings → Keys](https://login.tailscale.com/admin/settings/keys).  
-> Khuyến nghị dùng **ephemeral key** cho LXC — tự xóa khỏi tailnet khi offline.
-
-**Q: Unprivileged LXC có bị lỗi TUN không?**
-
-> Script tự động inject TUN device vào config — hoạt động bình thường với Unprivileged LXC trên Proxmox 7+.
-
-**Q: Script có hỗ trợ Alpine Linux không?**
-
-> Hiện tại chỉ hỗ trợ Debian/Ubuntu. Alpine đang được xem xét cho phiên bản sau.
+> Dùng **ephemeral key** cho LXC/server — tự xóa khỏi tailnet khi offline.  
+> Tạo tại [Tailscale Admin → Settings → Keys](https://login.tailscale.com/admin/settings/keys).
 
 ---
 
@@ -371,6 +426,6 @@ MIT © [dainghiavn](https://github.com/dainghiavn)
 
 ## 🙏 Credits
 
-- [Tailscale](https://tailscale.com) — WireGuard-based VPN
+- [Tailscale](https://tailscale.com) — WireGuard-based mesh VPN
 - [bash-lib](https://github.com/dainghiavn/bash-lib) — Bash helper library
 - [community-scripts/ProxmoxVE](https://github.com/community-scripts/ProxmoxVE) — Inspired by script pattern
