@@ -659,57 +659,72 @@ EOF
 # STEP 7 — Final summary trong LXC
 # =============================================================================
 _step7_summary() {
-    local ts_ip ts_ver conn_status
+    local ts_ip ts_ver ts_auth_status
 
-    ts_ip=$(tailscale ip -4 2>/dev/null || echo "chưa auth")
+    ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
     ts_ver=$(tailscale version 2>/dev/null | head -1 || echo "unknown")
-    conn_status=$(tailscale status 2>/dev/null | head -1 || echo "not connected")
+
+    # Detect DERP region đúng cách
+    local derp_region
+    derp_region=$(tailscale netcheck 2>/dev/null \
+        | grep -i "preferred\|best\|DERP" \
+        | grep -oP '(?<=: )\S+' | head -1 || echo "")
+    # Fallback: lấy từ tailscale status
+    if [[ -z "$derp_region" ]]; then
+        derp_region=$(tailscale status 2>/dev/null \
+            | grep -i "relay\|derp" \
+            | grep -oP '\w+-\d+' | head -1 || echo "DERP relay")
+    fi
+
+    # Truncate log path cho đẹp box
+    local log_short
+    log_short=$(get_log_file | sed 's|/var/log/||')
 
     echo ""
-    print_summary "Tailscale LXC — Cài đặt hoàn tất" \
+    print_summary "Tailscale — Cài đặt hoàn tất" \
         "Version"      "${ts_ver}" \
-        "Tailscale IP" "${ts_ip}" \
+        "Tailscale IP" "${ts_ip:-chưa auth}" \
+        "DERP region"  "${derp_region:-auto}" \
         "Mode"         "${INSTALL_MODE}" \
-        "Subnet Router" "$([[ $ENABLE_SUBNET   == 1 ]] && echo "ON: ${SUBNET_ROUTES}" || echo "OFF")" \
+        "Subnet"       "$([[ $ENABLE_SUBNET   == 1 ]] && echo "ON: ${SUBNET_ROUTES}" || echo "OFF")" \
         "Exit Node"    "$([[ $ENABLE_EXITNODE  == 1 ]] && echo "ON" || echo "OFF")" \
-        "TS SSH"       "$([[ $ENABLE_SSH       == 1 ]] && echo "ON" || echo "OFF")" \
-        "Log"          "$(get_log_file)"
+        "SSH"          "$([[ $ENABLE_SSH       == 1 ]] && echo "ON" || echo "OFF")" \
+        "Log"          "${log_short}"
 
-    # Hiển thị hướng dẫn nếu chưa auth
-    if [[ -z "$TS_AUTHKEY" ]]; then
+    # Chỉ hiển thị hướng dẫn auth nếu THỰC SỰ chưa auth
+    # (kiểm tra IP thay vì TS_AUTHKEY)
+    if [[ -z "$ts_ip" ]] || [[ ! "$ts_ip" =~ ^100\. ]]; then
         echo ""
-        echo -e "  ${C_WARN}${BLD}══ AUTH THỦ CÔNG — CẦN THỰC HIỆN NGAY ══${CL}"
-        echo ""
-        echo -e "  Chạy lệnh sau trong LXC này:"
+        echo -e "  ${C_WARN}${BLD}Chưa xác thực — chạy lệnh sau để auth:${CL}"
         echo ""
 
-        local up_cmd="  tailscale up"
+        local up_cmd="tailscale up --accept-routes"
         [[ "$ENABLE_SUBNET"   == "1" ]] && [[ -n "$SUBNET_ROUTES" ]] && \
-            up_cmd+=" \\\n    --advertise-routes=${SUBNET_ROUTES}"
+            up_cmd+=" --advertise-routes=${SUBNET_ROUTES}"
         [[ "$ENABLE_EXITNODE" == "1" ]] && \
-            up_cmd+=" \\\n    --advertise-exit-node"
+            up_cmd+=" --advertise-exit-node"
         [[ "$ENABLE_SSH"      == "1" ]] && \
-            up_cmd+=" \\\n    --ssh"
-        up_cmd+=" \\\n    --accept-routes"
+            up_cmd+=" --ssh"
 
         echo -e "  ${C_INFO}${up_cmd}${CL}"
         echo ""
-        echo -e "  Sau đó mở link hiện ra trên browser để đăng nhập."
-        echo ""
-        echo -e "  ${C_DIM}Tạo auth key tại:${CL}"
+        echo -e "  ${C_DIM}Tạo auth key:${CL}"
         echo -e "  ${C_INFO}https://login.tailscale.com/admin/settings/keys${CL}"
         echo ""
+    else
+        echo ""
+        msg_ok "Tailscale đã xác thực và kết nối!"
     fi
 
     # Advanced mode notes
     if [[ "$INSTALL_MODE" == "advanced" ]]; then
         if [[ "$ENABLE_SUBNET" == "1" ]] || [[ "$ENABLE_EXITNODE" == "1" ]]; then
             echo ""
-            echo -e "  ${C_WARN}${BLD}Lưu ý cho Admin Tailscale:${CL}"
+            echo -e "  ${C_WARN}${BLD}Việc cần làm trên Admin Console:${CL}"
             [[ "$ENABLE_SUBNET"   == "1" ]] && \
-                echo -e "  ${C_INFO}□${CL} Approve subnet route tại admin console"
+                echo -e "  ${C_INFO}□${CL} Approve subnet route"
             [[ "$ENABLE_EXITNODE" == "1" ]] && \
-                echo -e "  ${C_INFO}□${CL} Approve exit node tại admin console"
+                echo -e "  ${C_INFO}□${CL} Approve exit node"
             echo -e "  ${C_INFO}→${CL} https://login.tailscale.com/admin/machines"
         fi
     fi
