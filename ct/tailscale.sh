@@ -379,7 +379,7 @@ _check_tailscale_local() {
         TS_ALREADY_INSTALLED=1
         local ts_ver ts_status ts_ip
         ts_ver=$(tailscale version 2>/dev/null | head -1)
-        ts_ip=$(tailscale ip 2>/dev/null | head -1 || echo "chưa auth")
+        ts_ip=$(tailscale ip -4 2>/dev/null || echo "chưa auth")
 
         if systemctl is-active --quiet tailscaled 2>/dev/null; then
             ts_status="running"
@@ -955,7 +955,7 @@ _menu_manage() {
         echo -e "  ${C_DIM}Đã phát hiện Tailscale trong: CT${TS_EXISTING_CTID}${CL}"
     else
         local ts_ip
-        ts_ip=$(tailscale ip 2>/dev/null | head -1 || echo "chưa auth")
+        ts_ip=$(tailscale ip -4 2>/dev/null || echo "chưa auth")
         echo -e "  ${C_DIM}Tailscale đang chạy trên máy này | IP: ${ts_ip}${CL}"
     fi
     echo ""
@@ -1297,11 +1297,11 @@ _phase6_summary() {
     if [[ "$ENV_MODE" == "proxmox" ]]; then
         lxc_ip=$(get_lxc_ip "$CTID" 15)
         [[ -n "$TS_AUTHKEY" ]] && \
-            ts_ip=$(pct exec "$CTID" -- tailscale ip 2>/dev/null | head -1 || echo "")
+            ts_ip=$(pct exec "$CTID" -- tailscale ip -4 2>/dev/null || echo "")
     else
         lxc_ip=$(get_local_ip)
         [[ -n "$TS_AUTHKEY" ]] && \
-            ts_ip=$(tailscale ip 2>/dev/null | head -1 || echo "")
+            ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
     fi
 
     echo ""
@@ -1359,7 +1359,7 @@ _phase6_summary() {
 # ── Summary cho Standalone/LXC mode ──────────────────────────────────────────
 _phase6_summary_standalone() {
     local ts_ip ts_ver
-    ts_ip=$(tailscale ip 2>/dev/null | head -1 || echo "chưa auth")
+    ts_ip=$(tailscale ip -4 2>/dev/null || echo "chưa auth")
     ts_ver=$(tailscale version 2>/dev/null | head -1 || echo "unknown")
 
     local env_label
