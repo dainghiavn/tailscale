@@ -260,7 +260,7 @@ _step4_start_service() {
             return 0
         fi
         sleep 1
-        (( elapsed++ ))
+        (( elapsed++ )) || true
     done
 
     # Service chưa lên
@@ -330,7 +330,7 @@ _auth_interactive() {
     local attempt=0
 
     while (( attempt < max_retries )); do
-        (( attempt++ ))
+        (( attempt++ )) || true
 
         echo ""
         if (( attempt > 1 )); then
@@ -353,7 +353,7 @@ _auth_interactive() {
                 "$tmp_out" 2>/dev/null | head -1 || true)
             [[ -n "$auth_url" ]] && break
             sleep 1
-            (( elapsed++ ))
+            (( elapsed++ )) || true
         done
 
         # ── Hiển thị URL ──────────────────────────────────────────────────────
@@ -412,7 +412,7 @@ _auth_interactive() {
             fi
 
             sleep 2
-            (( wait_elapsed += 2 ))
+            (( wait_elapsed += 2 )) || true
         done
 
         printf "\r%*s\r" "60" ""   # Clear countdown line
@@ -600,7 +600,7 @@ _verify_auth() {
         fi
 
         sleep 1
-        (( elapsed++ ))
+        (( elapsed++ )) || true
     done
 
     msg_warn "Tailscale chưa kết nối được sau ${max_wait}s"
