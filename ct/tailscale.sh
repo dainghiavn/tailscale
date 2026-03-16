@@ -577,32 +577,37 @@ _check_tailscale_existing() {
     TS_ALREADY_INSTALLED=0
     TS_EXISTING_CTID=""
 
-    # Tìm Tailscale trong các LXC đang chạy
-    local ct_list
-    ct_list=$(pct list 2>/dev/null | awk 'NR>1 && $2=="running" {print $1}')
+    if [[ "$ENV_MODE" == "proxmox" ]]; then
+        # Proxmox: tìm trong các LXC đang chạy
+        local ct_list
+        ct_list=$(pct list 2>/dev/null | awk 'NR>1 && $2=="running" {print $1}')
 
-    local found_cts=()
-    for ctid in $ct_list; do
-        if pct exec "$ctid" -- which tailscale &>/dev/null 2>&1; then
-            local ct_name
-            ct_name=$(pct config "$ctid" 2>/dev/null \
-                | awk -F': ' '/^hostname/{print $2}')
-            local ts_status
-            ts_status=$(pct exec "$ctid" -- tailscale status \
-                --json 2>/dev/null | grep -o '"BackendState":"[^"]*"' \
-                | cut -d'"' -f4 || echo "unknown")
-            found_cts+=("CT${ctid} (${ct_name}) — ${ts_status}")
-            TS_EXISTING_CTID="$ctid"
-        fi
-    done
-
-    if [[ ${#found_cts[@]} -gt 0 ]]; then
-        TS_ALREADY_INSTALLED=1
-        for ct in "${found_cts[@]}"; do
-            msg_check "info" "Tailscale found" "$ct"
+        local found_cts=()
+        for ctid in $ct_list; do
+            if pct exec "$ctid" -- which tailscale &>/dev/null 2>&1; then
+                local ct_name ts_status
+                ct_name=$(pct config "$ctid" 2>/dev/null \
+                    | awk -F': ' '/^hostname/{print $2}')
+                ts_status=$(pct exec "$ctid" -- tailscale status \
+                    --json 2>/dev/null \
+                    | grep -o '"BackendState":"[^"]*"' \
+                    | cut -d'"' -f4 || echo "unknown")
+                found_cts+=("CT${ctid} (${ct_name}) — ${ts_status}")
+                TS_EXISTING_CTID="$ctid"
+            fi
         done
+
+        if [[ ${#found_cts[@]} -gt 0 ]]; then
+            TS_ALREADY_INSTALLED=1
+            for ct in "${found_cts[@]}"; do
+                msg_check "info" "Tailscale found" "$ct"
+            done
+        else
+            msg_check "pass" "Tailscale" "Chưa cài trong LXC nào — sẵn sàng cài mới"
+        fi
     else
-        msg_check "pass" "Tailscale" "Chưa cài — sẵn sàng cài mới"
+        # Standalone/LXC: kiểm tra trên máy hiện tại
+        _check_tailscale_local
     fi
 }
 
@@ -1149,27 +1154,49 @@ _do_install_direct() {
 # =============================================================================
 # PHASE 5b — Manage actions
 # =============================================================================
+
+# ── Helper: chạy lệnh trên đúng target theo ENV_MODE ─────────────────────────
+# Proxmox mode → pct exec <ctid> -- <cmd>
+# Standalone/LXC mode → chạy trực tiếp trên máy hiện tại
+_run_on_target() {
+    if [[ "$ENV_MODE" == "proxmox" ]] && [[ -n "$TS_EXISTING_CTID" ]]; then
+        pct exec "$TS_EXISTING_CTID" -- bash -c "$*"
+    else
+        bash -c "$*"
+    fi
+}
+
+# Label hiển thị target
+_target_label() {
+    if [[ "$ENV_MODE" == "proxmox" ]] && [[ -n "$TS_EXISTING_CTID" ]]; then
+        echo "CT${TS_EXISTING_CTID}"
+    else
+        echo "máy này ($(hostname))"
+    fi
+}
+
+
 _manage_features() {
-    local ctid="${TS_EXISTING_CTID}"
-    msg_section "ADD / REMOVE FEATURES — CT${ctid}"
+    local label
+    label=$(_target_label)
+    msg_section "ADD / REMOVE FEATURES — ${label}"
     echo ""
 
     # Lấy trạng thái hiện tại
-    local cur_exitnode cur_subnet cur_ssh
-    cur_exitnode=$(pct exec "$ctid" -- \
-        tailscale status --json 2>/dev/null \
-        | grep -c "ExitNode" || echo "0")
-    cur_ssh=$(pct exec "$ctid" -- \
-        tailscale status --json 2>/dev/null \
-        | grep -c '"SSH"' || echo "0")
+    local cur_exitnode cur_ssh
+    cur_exitnode=$(_run_on_target \
+        "tailscale status --json 2>/dev/null | grep -c 'ExitNode'" \
+        || echo "0")
+    cur_ssh=$(_run_on_target \
+        "tailscale status --json 2>/dev/null | grep -c '\"SSH\"'" \
+        || echo "0")
 
     echo -e "  Trạng thái hiện tại:"
-    echo -e "  ${C_DIM}Exit Node  : $([[ $cur_exitnode -gt 0 ]] && echo ON || echo OFF)${CL}"
-    echo -e "  ${C_DIM}Tailscale SSH: $([[ $cur_ssh -gt 0 ]] && echo ON || echo OFF)${CL}"
+    echo -e "  ${C_DIM}Exit Node    : $([[ ${cur_exitnode:-0} -gt 0 ]] && echo ON || echo OFF)${CL}"
+    echo -e "  ${C_DIM}Tailscale SSH: $([[ ${cur_ssh:-0} -gt 0 ]] && echo ON || echo OFF)${CL}"
     echo ""
 
-    local up_args="tailscale up"
-
+    local up_args="tailscale up --accept-routes"
     prompt_yn "Bật Exit Node?" "N" && up_args+=" --advertise-exit-node"
     prompt_yn "Bật Tailscale SSH?" "N" && up_args+=" --ssh"
 
@@ -1179,25 +1206,26 @@ _manage_features() {
     fi
 
     msg_info "Áp dụng cấu hình mới..."
-    pct exec "$ctid" -- bash -c "$up_args --reset"
+    _run_on_target "${up_args} --reset"
     msg_ok "Features đã cập nhật"
 }
 
 _update_tailscale() {
-    local ctid="${TS_EXISTING_CTID}"
-    msg_section "UPDATE TAILSCALE — CT${ctid}"
+    local label
+    label=$(_target_label)
+    msg_section "UPDATE TAILSCALE — ${label}"
 
-    msg_info "Đang update Tailscale trong CT${ctid}..."
-    pct exec "$ctid" -- bash -c \
-        "apt-get update -qq && apt-get install -y tailscale 2>&1"
+    msg_info "Đang update Tailscale..."
+    _run_on_target "apt-get update -qq && apt-get install -y tailscale"
     local new_ver
-    new_ver=$(pct exec "$ctid" -- tailscale version 2>/dev/null | head -1)
+    new_ver=$(_run_on_target "tailscale version 2>/dev/null | head -1")
     msg_ok "Update hoàn tất: ${new_ver}"
 }
 
 _reauthenticate() {
-    local ctid="${TS_EXISTING_CTID}"
-    msg_section "RE-AUTHENTICATE — CT${ctid}"
+    local label
+    label=$(_target_label)
+    msg_section "RE-AUTHENTICATE — ${label}"
     echo ""
 
     echo -e "  ${C_DIM}Tạo auth key tại:${CL}"
@@ -1206,50 +1234,54 @@ _reauthenticate() {
     prompt_input "Auth Key (tskey-auth-...)" ""
 
     if [[ -n "$REPLY" ]]; then
-        pct exec "$ctid" -- tailscale up --authkey="$REPLY" --reset
+        _run_on_target "tailscale up --authkey='${REPLY}' --reset"
         msg_ok "Re-authenticated thành công"
     else
-        msg_info "Chạy thủ công trong CT${ctid}:"
-        msg_plain "pct exec ${ctid} -- tailscale up"
+        msg_info "Chạy thủ công để auth:"
+        msg_plain "tailscale up"
     fi
 }
 
 _uninstall_tailscale() {
-    local ctid="${TS_EXISTING_CTID}"
-    msg_section "UNINSTALL — CT${ctid}"
+    local label
+    label=$(_target_label)
+    msg_section "UNINSTALL — ${label}"
     echo ""
     msg_warn "Hành động này sẽ:"
     msg_plain "Stop và disable tailscaled service"
     msg_plain "Gỡ Tailscale package (apt purge)"
-    msg_plain "Xóa TUN config khỏi LXC"
-    msg_plain "Xóa CT${ctid} khỏi tailnet"
+    [[ "$ENV_MODE" == "proxmox" ]] && \
+        msg_plain "Xóa TUN config khỏi LXC config"
     echo ""
 
-    if ! prompt_yn "Xác nhận uninstall Tailscale khỏi CT${ctid}?" "N"; then
+    if ! prompt_yn "Xác nhận uninstall Tailscale khỏi ${label}?" "N"; then
         msg_info "Đã hủy"
         return 0
     fi
 
     msg_info "Đang gỡ cài đặt..."
-    pct exec "$ctid" -- bash -c \
-        "tailscale logout 2>/dev/null; \
-         systemctl stop tailscaled; \
-         systemctl disable tailscaled; \
-         apt-get purge -y tailscale; \
-         apt-get autoremove -y; \
-         rm -rf /var/lib/tailscale"
+    _run_on_target \
+        "tailscale logout 2>/dev/null || true
+         systemctl stop tailscaled 2>/dev/null || true
+         systemctl disable tailscaled 2>/dev/null || true
+         apt-get purge -y tailscale 2>/dev/null || true
+         apt-get autoremove -y 2>/dev/null || true
+         rm -rf /var/lib/tailscale 2>/dev/null || true"
 
-    # Cleanup TUN từ LXC config
-    local conf="/etc/pve/lxc/${ctid}.conf"
-    if [[ -f "$conf" ]]; then
-        sed -i '/tailscale/Id' "$conf"
-        sed -i '/lxc.cgroup2.devices.allow.*10:200/d' "$conf"
-        sed -i '/lxc.mount.entry.*tun/d' "$conf"
-        msg_ok "TUN config đã xóa khỏi ${conf}"
+    # Proxmox mode: cleanup TUN từ LXC config
+    if [[ "$ENV_MODE" == "proxmox" ]] && [[ -n "$TS_EXISTING_CTID" ]]; then
+        local conf="/etc/pve/lxc/${TS_EXISTING_CTID}.conf"
+        if [[ -f "$conf" ]]; then
+            sed -i '/tailscale/Id' "$conf"
+            sed -i '/lxc.cgroup2.devices.allow.*10:200/d' "$conf"
+            sed -i '/lxc.mount.entry.*tun/d' "$conf"
+            msg_ok "TUN config đã xóa khỏi ${conf}"
+        fi
+        msg_ok "Tailscale đã gỡ khỏi CT${TS_EXISTING_CTID}"
+        msg_info "CT${TS_EXISTING_CTID} vẫn còn — xóa thủ công nếu không cần"
+    else
+        msg_ok "Tailscale đã gỡ khỏi ${label}"
     fi
-
-    msg_ok "Tailscale đã được gỡ khỏi CT${ctid}"
-    msg_info "Note: CT${ctid} vẫn còn — bạn có thể xóa thủ công nếu không cần"
 }
 
 # =============================================================================
@@ -1259,41 +1291,56 @@ _POST_INSTALL_NOTES=()
 _add_post_install_note() { _POST_INSTALL_NOTES+=("$1"); }
 
 _phase6_summary() {
-    local lxc_ip
-    lxc_ip=$(get_lxc_ip "$CTID" 15)
-
+    local lxc_ip=""
     local ts_ip=""
-    if [[ -n "$TS_AUTHKEY" ]]; then
-        ts_ip=$(pct exec "$CTID" -- tailscale ip 2>/dev/null | head -1 || echo "")
+
+    if [[ "$ENV_MODE" == "proxmox" ]]; then
+        lxc_ip=$(get_lxc_ip "$CTID" 15)
+        [[ -n "$TS_AUTHKEY" ]] && \
+            ts_ip=$(pct exec "$CTID" -- tailscale ip 2>/dev/null | head -1 || echo "")
+    else
+        lxc_ip=$(get_local_ip)
+        [[ -n "$TS_AUTHKEY" ]] && \
+            ts_ip=$(tailscale ip 2>/dev/null | head -1 || echo "")
     fi
 
     echo ""
     print_summary "HOÀN TẤT — ${APP} đã cài đặt" \
-        "CT ID"       "${CTID}" \
-        "Hostname"    "${CT_HOSTNAME}" \
-        "LAN IP"      "${lxc_ip:-đang lấy...}" \
+        "Môi trường"   "${ENV_MODE} (${STANDALONE_OS:-})" \
+        "Hostname"     "${CT_HOSTNAME:-$(hostname)}" \
+        "LAN IP"       "${lxc_ip:-đang lấy...}" \
         "Tailscale IP" "${ts_ip:-chưa auth}" \
-        "Conn Mode"   "${NET_CONN_MODE}" \
-        "Mode"        "${TS_INSTALL_MODE}" \
-        "Log"         "$(get_log_file)"
+        "Conn Mode"    "${NET_CONN_MODE}" \
+        "Mode"         "${TS_INSTALL_MODE}" \
+        "Log"          "$(get_log_file)"
 
-    # Auth instruction nếu chưa có key
+    # Auth instruction
     if [[ -z "$TS_AUTHKEY" ]]; then
         echo ""
         echo -e "  ${C_WARN}${BLD}Bước tiếp theo — Authenticate Tailscale:${CL}"
         echo ""
-        echo -e "  ${C_INFO}1.${CL} Vào CT${CTID}:"
-        echo -e "     ${C_DIM}pct exec ${CTID} -- bash${CL}"
-        echo ""
-        echo -e "  ${C_INFO}2.${CL} Chạy lệnh:"
+
         local up_cmd="tailscale up"
-        [[ "$TS_ENABLE_SUBNET"   -eq 1 ]] && up_cmd+=" --advertise-routes=${TS_SUBNET_ROUTES}"
-        [[ "$TS_ENABLE_EXITNODE" -eq 1 ]] && up_cmd+=" --advertise-exit-node"
-        [[ "$TS_ENABLE_SSH"      -eq 1 ]] && up_cmd+=" --ssh"
+        [[ "$TS_ENABLE_SUBNET"   -eq 1 ]] && \
+            up_cmd+=" --advertise-routes=${TS_SUBNET_ROUTES}"
+        [[ "$TS_ENABLE_EXITNODE" -eq 1 ]] && \
+            up_cmd+=" --advertise-exit-node"
+        [[ "$TS_ENABLE_SSH"      -eq 1 ]] && \
+            up_cmd+=" --ssh"
+
+        if [[ "$ENV_MODE" == "proxmox" ]]; then
+            echo -e "  ${C_INFO}1.${CL} Vào CT${CTID}:"
+            echo -e "     ${C_DIM}pct exec ${CTID} -- bash${CL}"
+            echo ""
+            echo -e "  ${C_INFO}2.${CL} Chạy lệnh:"
+        else
+            echo -e "  ${C_INFO}Chạy lệnh:"
+        fi
+
         echo -e "     ${C_DIM}${up_cmd}${CL}"
         echo ""
-        echo -e "  ${C_INFO}3.${CL} Mở link hiện ra → Đăng nhập Tailscale account"
-        echo -e "     ${BGN}https://login.tailscale.com${CL}"
+        echo -e "  Mở link hiện ra → Đăng nhập Tailscale account"
+        echo -e "  ${C_INFO}https://login.tailscale.com${CL}"
     fi
 
     # Post-install notes
