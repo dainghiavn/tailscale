@@ -78,14 +78,21 @@ _step0_verify_environment() {
     fi
     msg_ok "TUN device: /dev/net/tun OK"
 
-    # Internet check
-    if ! curl -fsSL --max-time 10 \
-        https://controlplane.tailscale.com/health &>/dev/null; then
-        msg_error "Không reach được Tailscale control plane"
-        msg_plain  "Kiểm tra network và DNS trong LXC"
+    # Internet / control plane check
+    # Dùng -sL không -f: server trả 404 là bình thường, 000 mới là lỗi
+    local http_code
+    http_code=$(curl -sL --max-time 10 \
+        -o /dev/null -w "%{http_code}" \
+        "https://controlplane.tailscale.com/health" 2>/dev/null \
+        | tr -d '[:space:]')
+
+    if [[ -z "$http_code" ]] || [[ "$http_code" == "000" ]]; then
+        msg_error "Không reach được Tailscale control plane (timeout/blocked)"
+        msg_plain  "Kiểm tra network và DNS"
+        msg_plain  "Test thủ công: curl -v https://controlplane.tailscale.com/health"
         exit 1
     fi
-    msg_ok "Tailscale control plane: reachable"
+    msg_ok "Tailscale control plane: reachable (HTTP ${http_code})"
 }
 
 # =============================================================================
