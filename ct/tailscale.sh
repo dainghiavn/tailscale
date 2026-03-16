@@ -1359,7 +1359,7 @@ _phase6_summary() {
 # ── Summary cho Standalone/LXC mode ──────────────────────────────────────────
 _phase6_summary_standalone() {
     local ts_ip ts_ver
-    ts_ip=$(tailscale ip -4 2>/dev/null || echo "chưa auth")
+    ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
     ts_ver=$(tailscale version 2>/dev/null | head -1 || echo "unknown")
 
     local env_label
@@ -1368,22 +1368,26 @@ _phase6_summary_standalone() {
         standalone) env_label="Linux (${STANDALONE_OS})" ;;
     esac
 
+    # Truncate log path
+    local log_short
+    log_short=$(get_log_file | sed 's|/var/log/||')
+
     echo ""
     print_summary "HOÀN TẤT — ${APP} đã cài đặt" \
         "Môi trường"   "${env_label}" \
         "Version"      "${ts_ver}" \
-        "Tailscale IP" "${ts_ip}" \
+        "Tailscale IP" "${ts_ip:-chưa auth}" \
         "Conn Mode"    "${NET_CONN_MODE}" \
         "Mode"         "${TS_INSTALL_MODE}" \
-        "Log"          "$(get_log_file)"
+        "Log"          "${log_short}"
 
-    # Hướng dẫn auth nếu chưa có key
-    if [[ -z "$TS_AUTHKEY" ]]; then
+    # Chỉ show hướng dẫn auth nếu THỰC SỰ chưa auth
+    if [[ -z "$ts_ip" ]] || [[ ! "$ts_ip" =~ ^100\. ]]; then
         echo ""
-        echo -e "  ${C_WARN}${BLD}Bước tiếp theo — Authenticate Tailscale:${CL}"
+        echo -e "  ${C_WARN}${BLD}Chưa xác thực — chạy lệnh sau:${CL}"
         echo ""
 
-        local up_cmd="tailscale up"
+        local up_cmd="tailscale up --accept-routes"
         [[ "$TS_ENABLE_SUBNET"   -eq 1 ]] && \
             up_cmd+=" --advertise-routes=${TS_SUBNET_ROUTES}"
         [[ "$TS_ENABLE_EXITNODE" -eq 1 ]] && \
@@ -1391,11 +1395,12 @@ _phase6_summary_standalone() {
         [[ "$TS_ENABLE_SSH"      -eq 1 ]] && \
             up_cmd+=" --ssh"
 
-        echo -e "  Chạy lệnh:"
         echo -e "  ${C_INFO}${up_cmd}${CL}"
         echo ""
-        echo -e "  Mở link hiện ra trên browser để đăng nhập."
         echo -e "  ${C_DIM}https://login.tailscale.com${CL}"
+    else
+        echo ""
+        msg_ok "Tailscale đã xác thực — IP: ${ts_ip}"
     fi
 
     if [[ ${#_POST_INSTALL_NOTES[@]} -gt 0 ]]; then
