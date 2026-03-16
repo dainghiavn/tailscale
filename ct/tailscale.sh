@@ -2,12 +2,18 @@
 # =============================================================================
 # tailscale-proxmox/ct/tailscale.sh
 #
-# Cài đặt Tailscale vào LXC mới trên Proxmox
-# Tác giả  : dainghiavn
-# License  : MIT
-# Source   : https://tailscale.com
+# Cài đặt Tailscale — tự detect môi trường và điều chỉnh theo
 #
-# Chạy lệnh này trên Proxmox shell:
+# Hỗ trợ:
+#   - Proxmox VE host  → tạo LXC mới → cài Tailscale bên trong
+#   - Linux standalone → cài Tailscale trực tiếp (Ubuntu/Debian/RPi/VPS/Docker)
+#   - LXC container    → cài Tailscale trực tiếp vào container hiện tại
+#
+# Tác giả : dainghiavn
+# License : MIT
+# Source  : https://tailscale.com
+#
+# Chạy (mọi môi trường):
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/dainghiavn/tailscale/main/ct/tailscale.sh)"
 # =============================================================================
 
@@ -19,27 +25,34 @@ source <(curl -fsSL https://raw.githubusercontent.com/dainghiavn/bash-lib/main/l
     exit 1
 }
 load_network
-load_proxmox
+
+# load_proxmox chỉ khi cần — sẽ gọi sau khi detect môi trường
 
 # ── Thông số mặc định LXC ────────────────────────────────────────────────────
 readonly APP="Tailscale"
 readonly APP_VERSION="latest"
 readonly INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/dainghiavn/tailscale/main/install/tailscale-install.sh"
 
-# LXC defaults — override được bằng biến môi trường
-CTID="${CTID:-}"                        # tự động tìm nếu để trống
+# Environment mode — tự detect trong _phase0_entry()
+ENV_MODE=""         # proxmox | standalone | lxc
+
+# Standalone OS type — detect trong _detect_standalone_os()
+STANDALONE_OS=""    # ubuntu | debian | raspberrypi | vps | docker | unknown
+
+# LXC defaults (chỉ dùng khi ENV_MODE=proxmox)
+CTID="${CTID:-}"
 CT_HOSTNAME="${CT_HOSTNAME:-tailscale}"
-CT_RAM="${CT_RAM:-128}"                 # MB
+CT_RAM="${CT_RAM:-128}"
 CT_CPU="${CT_CPU:-1}"
-CT_DISK="${CT_DISK:-2}"                 # GB
+CT_DISK="${CT_DISK:-2}"
 CT_OS="${CT_OS:-debian}"
 CT_OS_VERSION="${CT_OS_VERSION:-12}"
 CT_BRIDGE="${CT_BRIDGE:-vmbr0}"
 CT_UNPRIVILEGED="${CT_UNPRIVILEGED:-1}"
 
-# Tailscale options — được set từ menu
+# Tailscale options
 TS_AUTHKEY=""
-TS_INSTALL_MODE="simple"               # simple | advanced
+TS_INSTALL_MODE="simple"
 TS_ENABLE_SUBNET=0
 TS_ENABLE_EXITNODE=0
 TS_ENABLE_SSH=0
@@ -48,64 +61,161 @@ TS_HOSTNAME=""
 
 # Preflight scoring
 PREFLIGHT_SCORE=0
-PREFLIGHT_VERDICT=""                   # GO | WARN | STOP | ABORT
-NET_CONN_MODE="unknown"               # direct | hybrid | derp_only | no_connection
+PREFLIGHT_VERDICT=""
+NET_CONN_MODE="unknown"
 
 # =============================================================================
-# PHASE 0 — Entry + Header
+# PHASE 0 — Entry + Environment Detection
 # =============================================================================
 _phase0_entry() {
     catch_errors
     check_root
 
     header_info "$APP" "$APP_VERSION"
-
-    echo -e "  ${C_DIM}Installer cho Proxmox LXC${CL}"
     echo -e "  ${C_DIM}Log: $(get_log_file)${CL}"
     echo ""
 
-    # Phải chạy từ Proxmox host
-    if ! is_proxmox_host; then
-        msg_error "Script này phải chạy từ Proxmox VE host shell"
-        msg_plain "Nếu muốn cài trực tiếp vào LXC hiện tại, dùng:"
-        msg_plain "bash <(curl -fsSL ${INSTALL_SCRIPT_URL})"
-        exit 1
+    # ── Detect môi trường ──────────────────────────────────────────────────
+    _detect_environment
+
+    # ── Hiển thị môi trường đang chạy ─────────────────────────────────────
+    case "$ENV_MODE" in
+        proxmox)
+            msg_ok    "Môi trường  : Proxmox VE $(pveversion 2>/dev/null | grep -oP 'pve-manager/\K[0-9.]+' || echo '')"
+            msg_plain "Chế độ     : Tạo LXC mới → Cài Tailscale bên trong"
+            load_proxmox
+            ;;
+        lxc)
+            msg_ok    "Môi trường  : LXC Container"
+            msg_plain "Chế độ     : Cài Tailscale trực tiếp vào container này"
+            ;;
+        standalone)
+            msg_ok    "Môi trường  : Linux Standalone (${STANDALONE_OS})"
+            msg_plain "Chế độ     : Cài Tailscale trực tiếp"
+            ;;
+    esac
+    echo ""
+}
+
+# Detect chính xác đang chạy ở đâu
+_detect_environment() {
+    if is_proxmox_host; then
+        ENV_MODE="proxmox"
+        return
     fi
 
-    msg_ok "Đang chạy trên Proxmox VE host"
+    if is_lxc_container; then
+        ENV_MODE="lxc"
+        _detect_standalone_os
+        return
+    fi
+
+    # Linux standalone
+    ENV_MODE="standalone"
+    _detect_standalone_os
+}
+
+# Detect OS type chi tiết cho standalone/lxc
+_detect_standalone_os() {
+    detect_os
+
+    # Raspberry Pi
+    if [[ -f /proc/device-tree/model ]] && \
+       grep -qi "raspberry" /proc/device-tree/model 2>/dev/null; then
+        STANDALONE_OS="raspberrypi"
+        return
+    fi
+
+    # Docker host — có docker daemon
+    if command -v docker &>/dev/null && \
+       docker info &>/dev/null 2>&1; then
+        STANDALONE_OS="docker"
+        return
+    fi
+
+    # VPS/Cloud — detect qua DMI hoặc cloud metadata
+    if _is_cloud_vps; then
+        STANDALONE_OS="vps"
+        return
+    fi
+
+    # Ubuntu / Debian
+    case "$OS_ID" in
+        ubuntu)  STANDALONE_OS="ubuntu"  ;;
+        debian)  STANDALONE_OS="debian"  ;;
+        *)       STANDALONE_OS="unknown" ;;
+    esac
+}
+
+# Detect VPS/Cloud environment
+_is_cloud_vps() {
+    # Kiểm tra cloud-init
+    [[ -f /run/cloud-init/result.json ]] && return 0
+
+    # DMI product name
+    local dmi_product
+    dmi_product=$(cat /sys/class/dmi/id/product_name 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    case "$dmi_product" in
+        *kvm*|*droplet*|*linode*|*vultr*|*hetzner*|\
+        *aws*|*google*|*azure*|*alibaba*|*tencent*)
+            return 0 ;;
+    esac
+
+    # Systemd detect-virt
+    local virt
+    virt=$(systemd-detect-virt 2>/dev/null || echo "none")
+    [[ "$virt" == "kvm" ]] && return 0
+    [[ "$virt" == "xen" ]] && return 0
+
+    return 1
 }
 
 # =============================================================================
-# PHASE 1 — Preflight Scan
+# PHASE 1 — Preflight Scan (theo môi trường)
 # =============================================================================
 _phase1_preflight() {
     msg_section "PREFLIGHT SCAN — Kiểm tra hệ thống"
     echo -e "  ${C_DIM}Đang quét... vui lòng chờ${CL}\n"
 
-    # ── Group 1: System ───────────────────────────────────────────────────────
-    msg_section "① SYSTEM"
-    _check_system
+    case "$ENV_MODE" in
+        proxmox)
+            # Full preflight cho Proxmox
+            msg_section "① SYSTEM (Proxmox)"
+            _check_system
 
-    # ── Group 2: Network ──────────────────────────────────────────────────────
-    msg_section "② NETWORK"
-    _check_network
+            msg_section "② NETWORK"
+            _check_network
 
-    # ── Group 3: UDP / NAT ────────────────────────────────────────────────────
-    msg_section "③ UDP / NAT  (ảnh hưởng chất lượng kết nối)"
-    _check_udp_nat
+            msg_section "③ UDP / NAT  (ảnh hưởng chất lượng kết nối)"
+            _check_udp_nat
 
-    # ── Group 4: Tailscale existing ───────────────────────────────────────────
-    msg_section "④ TAILSCALE"
-    _check_tailscale_existing
+            msg_section "④ TAILSCALE"
+            _check_tailscale_existing
 
-    # ── Group 5: Security ─────────────────────────────────────────────────────
-    msg_section "⑤ SECURITY"
-    _check_security
+            msg_section "⑤ SECURITY"
+            _check_security
+            ;;
 
-    # ── Tính verdict ──────────────────────────────────────────────────────────
+        lxc|standalone)
+            # Preflight nhẹ hơn — không check PVE, không check storage/CT ID
+            msg_section "① SYSTEM"
+            _check_system_standalone
+
+            msg_section "② NETWORK"
+            _check_network
+
+            msg_section "③ UDP / NAT  (ảnh hưởng chất lượng kết nối)"
+            _check_udp_nat
+
+            msg_section "④ TAILSCALE"
+            _check_tailscale_local
+
+            msg_section "⑤ SECURITY"
+            _check_security_standalone
+            ;;
+    esac
+
     _calculate_verdict
-
-    # ── In report ─────────────────────────────────────────────────────────────
     _print_preflight_report
 }
 
@@ -153,7 +263,177 @@ _check_system() {
     fi
 }
 
-# ── Group 2: Network checks ───────────────────────────────────────────────────
+# ── Group 1b: System check cho Standalone/LXC ────────────────────────────────
+_check_system_standalone() {
+    detect_os
+
+    # OS supported?
+    case "$OS_ID" in
+        debian|ubuntu|raspbian)
+            msg_check "pass" "OS" "${OS_ID} ${OS_VERSION} (${OS_CODENAME})"
+            PREFLIGHT_SCORE=$(( PREFLIGHT_SCORE + 1 ))
+            ;;
+        *)
+            msg_check "warn" "OS" "${OS_ID} — chưa test đầy đủ"
+            _add_issue "WARN" "OS ${OS_ID} chưa được test — có thể có lỗi"
+            ;;
+    esac
+
+    # Architecture
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|aarch64|armv7l)
+            msg_check "pass" "Architecture" "${arch} — Tailscale hỗ trợ"
+            PREFLIGHT_SCORE=$(( PREFLIGHT_SCORE + 1 ))
+            ;;
+        *)
+            msg_check "warn" "Architecture" "${arch} — kiểm tra Tailscale support"
+            _add_issue "WARN" "Architecture ${arch} — xem tailscale.com/download"
+            ;;
+    esac
+
+    # Disk space (cần ~200MB cho package)
+    if check_disk_space "/" 512; then
+        PREFLIGHT_SCORE=$(( PREFLIGHT_SCORE + 1 ))
+    else
+        _add_issue "WARN" "Disk thấp — cần ít nhất 512MB"
+    fi
+
+    # RAM
+    check_ram 128
+
+    # Raspberry Pi specific
+    if [[ "$STANDALONE_OS" == "raspberrypi" ]]; then
+        local model
+        model=$(cat /proc/device-tree/model 2>/dev/null | tr -d '\0')
+        msg_check "info" "Raspberry Pi" "${model}"
+
+        # Check kernel version cho RPi
+        local kernel
+        kernel=$(uname -r)
+        msg_check "info" "Kernel" "${kernel}"
+
+        _add_issue "INFO" \
+            "Raspberry Pi: đảm bảo đã enable tun module (modprobe tun)"
+    fi
+
+    # Docker host specific
+    if [[ "$STANDALONE_OS" == "docker" ]]; then
+        msg_check "warn" "Docker host" \
+            "Tailscale + Docker cần config routing cẩn thận"
+        _add_issue "WARN" \
+            "Docker: ip_forward và iptables rules có thể conflict"
+        _add_checklist \
+            "Xem: https://tailscale.com/kb/1130/docker"
+    fi
+
+    # VPS specific
+    if [[ "$STANDALONE_OS" == "vps" ]]; then
+        local provider
+        provider=$(cat /sys/class/dmi/id/product_name 2>/dev/null \
+            | tr '[:upper:]' '[:lower:]' || echo "unknown")
+        msg_check "info" "VPS/Cloud" "${provider}"
+        _add_issue "INFO" \
+            "VPS: kiểm tra provider có block UDP outbound không"
+    fi
+
+    # systemd check
+    if systemctl --version &>/dev/null; then
+        msg_check "pass" "systemd" "$(systemctl --version | head -1)"
+        PREFLIGHT_SCORE=$(( PREFLIGHT_SCORE + 1 ))
+    else
+        msg_check "warn" "systemd" "Không có — tailscaled sẽ cần start thủ công"
+        _add_issue "WARN" "Không có systemd — service management thủ công"
+    fi
+
+    # TUN device — quan trọng cho mọi môi trường
+    if [[ -c /dev/net/tun ]]; then
+        msg_check "pass" "TUN device" "/dev/net/tun có sẵn"
+        PREFLIGHT_SCORE=$(( PREFLIGHT_SCORE + 1 ))
+    else
+        # Thử load module
+        if modprobe tun &>/dev/null; then
+            msg_check "pass" "TUN device" "Loaded via modprobe tun"
+            PREFLIGHT_SCORE=$(( PREFLIGHT_SCORE + 1 ))
+        else
+            msg_check "fail" "TUN device" "/dev/net/tun không có"
+            PREFLIGHT_SCORE=$(( PREFLIGHT_SCORE - 2 ))
+            _add_issue "STOP" "TUN device không có — Tailscale không thể chạy"
+            _add_checklist "Chạy: modprobe tun"
+            _add_checklist "Hoặc thêm 'tun' vào /etc/modules rồi reboot"
+            if [[ "$ENV_MODE" == "lxc" ]]; then
+                _add_checklist \
+                    "Trong LXC: yêu cầu Proxmox host inject TUN device vào config"
+            fi
+        fi
+    fi
+}
+
+# ── Group 4b: Tailscale check trên máy local ─────────────────────────────────
+_check_tailscale_local() {
+    TS_ALREADY_INSTALLED=0
+    TS_EXISTING_CTID=""
+
+    if command -v tailscale &>/dev/null; then
+        TS_ALREADY_INSTALLED=1
+        local ts_ver ts_status ts_ip
+        ts_ver=$(tailscale version 2>/dev/null | head -1)
+        ts_ip=$(tailscale ip 2>/dev/null | head -1 || echo "chưa auth")
+
+        if systemctl is-active --quiet tailscaled 2>/dev/null; then
+            ts_status="running"
+            msg_check "info" "Tailscale" \
+                "Đã cài: ${ts_ver} | IP: ${ts_ip}"
+        else
+            ts_status="stopped"
+            msg_check "warn" "Tailscale" \
+                "Đã cài (${ts_ver}) nhưng service không chạy"
+            _add_issue "WARN" "tailscaled service không chạy"
+            _add_checklist "systemctl start tailscaled"
+        fi
+    else
+        msg_check "pass" "Tailscale" "Chưa cài — sẵn sàng cài mới"
+        PREFLIGHT_SCORE=$(( PREFLIGHT_SCORE + 1 ))
+    fi
+}
+
+# ── Group 5b: Security check cho Standalone/LXC ──────────────────────────────
+_check_security_standalone() {
+    # ip_forward
+    local ipfwd
+    ipfwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "0")
+    if [[ "$ipfwd" == "1" ]]; then
+        msg_check "pass" "ip_forward" "Đã enable"
+    else
+        msg_check "info" "ip_forward" \
+            "Chưa enable — sẽ tự enable nếu dùng Subnet/Exit Node"
+    fi
+
+    # iptables
+    if command -v iptables &>/dev/null; then
+        msg_check "pass" "iptables" "Available"
+    else
+        msg_check "warn" "iptables" \
+            "Không có — Subnet Router/Exit Node có thể không hoạt động"
+        _add_issue "WARN" "iptables không có — cần cho Subnet Router và Exit Node"
+        _add_checklist "apt-get install -y iptables"
+    fi
+
+    # SSH đang chạy?
+    if systemctl is-active --quiet ssh sshd 2>/dev/null; then
+        msg_check "info" "SSH service" \
+            "Đang chạy — Tailscale SSH sẽ bổ sung, không thay thế"
+    fi
+
+    # Running as root trong LXC unprivileged?
+    if [[ "$ENV_MODE" == "lxc" ]]; then
+        if grep -qa "container=lxc" /proc/1/environ 2>/dev/null; then
+            msg_check "info" "LXC container" \
+                "Đang chạy trong LXC — TUN phải được config từ host"
+        fi
+    fi
+}
 _check_network() {
     # Gateway
     if check_gateway; then
@@ -608,14 +888,16 @@ _prompt_force_decision() {
 }
 
 # =============================================================================
-# PHASE 3 — Dynamic Menu
+# PHASE 3 — Dynamic Menu (theo môi trường + trạng thái)
 # =============================================================================
 _phase3_menu() {
     echo ""
 
     if [[ "$TS_ALREADY_INSTALLED" -eq 1 ]]; then
+        # Đã cài → menu quản lý
         _menu_manage
     else
+        # Chưa cài → menu cài mới
         _menu_fresh_install
     fi
 }
@@ -663,7 +945,15 @@ _menu_fresh_install() {
 # ── Menu: Quản lý (đã cài) ────────────────────────────────────────────────────
 _menu_manage() {
     msg_section "MENU — QUẢN LÝ TAILSCALE"
-    echo -e "  ${C_DIM}Đã phát hiện Tailscale trong: CT${TS_EXISTING_CTID}${CL}"
+
+    # Hiển thị context theo môi trường
+    if [[ "$ENV_MODE" == "proxmox" ]] && [[ -n "$TS_EXISTING_CTID" ]]; then
+        echo -e "  ${C_DIM}Đã phát hiện Tailscale trong: CT${TS_EXISTING_CTID}${CL}"
+    else
+        local ts_ip
+        ts_ip=$(tailscale ip 2>/dev/null | head -1 || echo "chưa auth")
+        echo -e "  ${C_DIM}Tailscale đang chạy trên máy này | IP: ${ts_ip}${CL}"
+    fi
     echo ""
     echo -e "  ${C_INFO}[M]${CL}  Add / Remove features"
     echo -e "  ${C_INFO}[U]${CL}  Update Tailscale"
@@ -687,9 +977,14 @@ _menu_manage() {
 }
 
 # =============================================================================
-# PHASE 4 — Configure LXC
+# PHASE 4 — Configure (theo môi trường)
 # =============================================================================
 _configure_lxc() {
+    # Standalone/LXC mode không cần config LXC
+    if [[ "$ENV_MODE" != "proxmox" ]]; then
+        return 0
+    fi
+
     msg_section "CẤU HÌNH LXC"
 
     # Hiển thị defaults
@@ -775,41 +1070,38 @@ _configure_advanced() {
 }
 
 # =============================================================================
-# PHASE 5 — Thực hiện cài đặt
+# PHASE 5 — Thực hiện cài đặt (theo môi trường)
 # =============================================================================
 _do_install() {
-    msg_section "BẮT ĐẦU CÀI ĐẶT"
-    echo ""
+    case "$ENV_MODE" in
+        proxmox)    _do_install_proxmox    ;;
+        lxc)        _do_install_direct     ;;
+        standalone) _do_install_direct     ;;
+    esac
+}
 
-    # Tạo LXC
+# ── Cài trên Proxmox: tạo LXC → inject → run install script ──────────────────
+_do_install_proxmox() {
+    msg_section "BẮT ĐẦU CÀI ĐẶT — Proxmox mode"
+
     msg_info "Bước 1/4: Tạo LXC CT${CTID}"
     create_lxc \
-        "$CTID" \
-        "$CT_HOSTNAME" \
-        "$PVE_TEMPLATE" \
-        "$PVE_STORAGE" \
-        "$CT_RAM" \
-        "$CT_CPU" \
-        "$CT_DISK" \
-        "$CT_BRIDGE" \
-        "$CT_UNPRIVILEGED"
+        "$CTID" "$CT_HOSTNAME" "$PVE_TEMPLATE" \
+        "$PVE_STORAGE" "$CT_RAM" "$CT_CPU" \
+        "$CT_DISK" "$CT_BRIDGE" "$CT_UNPRIVILEGED"
 
-    # Inject TUN device
     msg_info "Bước 2/4: Inject TUN device"
     inject_tun_device "$CTID"
 
-    # Enable ip_forward nếu cần
-    if [[ "$TS_ENABLE_SUBNET" -eq 1 ]] || [[ "$TS_ENABLE_EXITNODE" -eq 1 ]]; then
+    if [[ "$TS_ENABLE_SUBNET" -eq 1 ]] || \
+       [[ "$TS_ENABLE_EXITNODE" -eq 1 ]]; then
         enable_ip_forward_host
     fi
 
-    # Start LXC
     msg_info "Bước 3/4: Khởi động CT${CTID}"
     start_lxc "$CTID" 30
 
-    # Chạy install script bên trong LXC
     msg_info "Bước 4/4: Cài Tailscale bên trong CT${CTID}"
-
     local env_vars=(
         "INSTALL_MODE=${TS_INSTALL_MODE}"
         "ENABLE_SUBNET=${TS_ENABLE_SUBNET}"
@@ -818,15 +1110,10 @@ _do_install() {
         "SUBNET_ROUTES=${TS_SUBNET_ROUTES}"
         "TS_HOSTNAME=${CT_HOSTNAME}"
     )
-
-    # Auth key — truyền riêng để tránh log
-    if [[ -n "$TS_AUTHKEY" ]]; then
-        env_vars+=("TS_AUTHKEY=${TS_AUTHKEY}")
-    fi
+    [[ -n "$TS_AUTHKEY" ]] && env_vars+=("TS_AUTHKEY=${TS_AUTHKEY}")
 
     pct_exec_script "$CTID" "$INSTALL_SCRIPT_URL" "${env_vars[@]}"
 
-    # Set description
     set_lxc_description "$CTID" "$APP" \
         "Mode: ${TS_INSTALL_MODE}
 Conn: ${NET_CONN_MODE}
@@ -835,6 +1122,29 @@ ExitNode: ${TS_ENABLE_EXITNODE}
 SSH: ${TS_ENABLE_SSH}"
 
     _phase6_summary
+}
+
+# ── Cài trực tiếp: standalone Linux / LXC container ──────────────────────────
+_do_install_direct() {
+    msg_section "BẮT ĐẦU CÀI ĐẶT — $(
+        [[ "$ENV_MODE" == "lxc" ]] && echo "LXC" || echo "${STANDALONE_OS}"
+    ) mode"
+
+    msg_info "Tải và chạy install script..."
+
+    # Build env vars
+    export INSTALL_MODE="$TS_INSTALL_MODE"
+    export ENABLE_SUBNET="$TS_ENABLE_SUBNET"
+    export ENABLE_EXITNODE="$TS_ENABLE_EXITNODE"
+    export ENABLE_SSH="$TS_ENABLE_SSH"
+    export SUBNET_ROUTES="$TS_SUBNET_ROUTES"
+    export TS_HOSTNAME="${TS_HOSTNAME:-$(hostname)}"
+    [[ -n "$TS_AUTHKEY" ]] && export TS_AUTHKEY
+
+    # Chạy install script trực tiếp trên máy này
+    bash <(curl -fsSL "$INSTALL_SCRIPT_URL")
+
+    _phase6_summary_standalone
 }
 
 # =============================================================================
@@ -1000,9 +1310,61 @@ _phase6_summary() {
     log_summary
 }
 
-# =============================================================================
-# MAIN — Entry point
-# =============================================================================
+# ── Summary cho Standalone/LXC mode ──────────────────────────────────────────
+_phase6_summary_standalone() {
+    local ts_ip ts_ver
+    ts_ip=$(tailscale ip 2>/dev/null | head -1 || echo "chưa auth")
+    ts_ver=$(tailscale version 2>/dev/null | head -1 || echo "unknown")
+
+    local env_label
+    case "$ENV_MODE" in
+        lxc)        env_label="LXC Container" ;;
+        standalone) env_label="Linux (${STANDALONE_OS})" ;;
+    esac
+
+    echo ""
+    print_summary "HOÀN TẤT — ${APP} đã cài đặt" \
+        "Môi trường"   "${env_label}" \
+        "Version"      "${ts_ver}" \
+        "Tailscale IP" "${ts_ip}" \
+        "Conn Mode"    "${NET_CONN_MODE}" \
+        "Mode"         "${TS_INSTALL_MODE}" \
+        "Log"          "$(get_log_file)"
+
+    # Hướng dẫn auth nếu chưa có key
+    if [[ -z "$TS_AUTHKEY" ]]; then
+        echo ""
+        echo -e "  ${C_WARN}${BLD}Bước tiếp theo — Authenticate Tailscale:${CL}"
+        echo ""
+
+        local up_cmd="tailscale up"
+        [[ "$TS_ENABLE_SUBNET"   -eq 1 ]] && \
+            up_cmd+=" --advertise-routes=${TS_SUBNET_ROUTES}"
+        [[ "$TS_ENABLE_EXITNODE" -eq 1 ]] && \
+            up_cmd+=" --advertise-exit-node"
+        [[ "$TS_ENABLE_SSH"      -eq 1 ]] && \
+            up_cmd+=" --ssh"
+
+        echo -e "  Chạy lệnh:"
+        echo -e "  ${C_INFO}${up_cmd}${CL}"
+        echo ""
+        echo -e "  Mở link hiện ra trên browser để đăng nhập."
+        echo -e "  ${C_DIM}https://login.tailscale.com${CL}"
+    fi
+
+    if [[ ${#_POST_INSTALL_NOTES[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "  ${C_WARN}${BLD}Lưu ý sau cài đặt:${CL}"
+        for note in "${_POST_INSTALL_NOTES[@]}"; do
+            echo -e "  ${C_INFO}□${CL} ${note}"
+        done
+    fi
+
+    echo ""
+    log_summary
+}
+
+
 main() {
     _phase0_entry        # Kiểm tra môi trường + root
     _phase1_preflight    # Scan 5 nhóm
