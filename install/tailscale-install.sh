@@ -1,0 +1,454 @@
+#!/usr/bin/env bash
+# =============================================================================
+# tailscale-proxmox/install/tailscale-install.sh
+#
+# Chạy BÊN TRONG LXC — được gọi từ ct/tailscale.sh qua pct_exec_script()
+# Không chạy trực tiếp trên Proxmox host!
+#
+# Nhận biến môi trường từ host:
+#   INSTALL_MODE    = simple | advanced
+#   ENABLE_SUBNET   = 0 | 1
+#   ENABLE_EXITNODE = 0 | 1
+#   ENABLE_SSH      = 0 | 1
+#   SUBNET_ROUTES   = "192.168.1.0/24,10.0.0.0/8"
+#   TS_HOSTNAME     = tên hostname
+#   TS_AUTHKEY      = tskey-auth-xxx (optional)
+# =============================================================================
+
+# ── Import bash-lib (core only — trong LXC không cần proxmox module) ─────────
+BASHLIB_APP_NAME="tailscale-lxc-install"
+BASHLIB_LOG_DIR="/var/log"
+source <(curl -fsSL \
+    https://raw.githubusercontent.com/dainghiavn/bash-lib/main/lib.sh) || {
+    echo "[ERROR] Không load được bash-lib" >&2
+    exit 1
+}
+
+# ── Nhận env vars với giá trị mặc định ───────────────────────────────────────
+INSTALL_MODE="${INSTALL_MODE:-simple}"
+ENABLE_SUBNET="${ENABLE_SUBNET:-0}"
+ENABLE_EXITNODE="${ENABLE_EXITNODE:-0}"
+ENABLE_SSH="${ENABLE_SSH:-0}"
+SUBNET_ROUTES="${SUBNET_ROUTES:-}"
+TS_HOSTNAME="${TS_HOSTNAME:-tailscale}"
+TS_AUTHKEY="${TS_AUTHKEY:-}"
+
+# Tailscale apt repo
+readonly TS_APT_KEY="/usr/share/keyrings/tailscale-archive-keyring.gpg"
+readonly TS_APT_LIST="/etc/apt/sources.list.d/tailscale.list"
+readonly TS_SYSCTL_CONF="/etc/sysctl.d/99-tailscale.conf"
+
+# =============================================================================
+# STEP 0 — Kiểm tra môi trường LXC
+# =============================================================================
+_step0_verify_environment() {
+    msg_section "Kiểm tra môi trường LXC"
+
+    catch_errors
+    check_root
+
+    # Phải chạy trong LXC
+    if ! is_lxc_container; then
+        msg_warn "Không detect được LXC container — tiếp tục nhưng cẩn thận"
+    else
+        msg_ok "Đang chạy trong LXC container"
+    fi
+
+    # OS check
+    detect_os
+    case "$OS_ID" in
+        debian|ubuntu|raspbian)
+            msg_ok "OS: ${OS_ID} ${OS_VERSION} (${OS_CODENAME})"
+            ;;
+        *)
+            msg_error "OS không hỗ trợ: ${OS_ID}"
+            msg_plain  "Hỗ trợ: Debian, Ubuntu"
+            exit 1
+            ;;
+    esac
+
+    # TUN device — bắt buộc
+    if [[ ! -c /dev/net/tun ]]; then
+        msg_error "/dev/net/tun không tồn tại trong LXC này"
+        msg_plain  "Kiểm tra lại: ct/tailscale.sh có inject TUN device không"
+        msg_plain  "Manual fix trên Proxmox host:"
+        msg_plain  "  echo 'lxc.cgroup2.devices.allow: c 10:200 rwm' >> /etc/pve/lxc/\$CTID.conf"
+        msg_plain  "  echo 'lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file' >> /etc/pve/lxc/\$CTID.conf"
+        exit 1
+    fi
+    msg_ok "TUN device: /dev/net/tun OK"
+
+    # Internet check
+    if ! curl -fsSL --max-time 10 \
+        https://controlplane.tailscale.com/health &>/dev/null; then
+        msg_error "Không reach được Tailscale control plane"
+        msg_plain  "Kiểm tra network và DNS trong LXC"
+        exit 1
+    fi
+    msg_ok "Tailscale control plane: reachable"
+}
+
+# =============================================================================
+# STEP 1 — Chuẩn bị hệ thống
+# =============================================================================
+_step1_prepare_system() {
+    msg_section "Chuẩn bị hệ thống"
+
+    # Update package list
+    msg_info "Update package list..."
+    $STD apt-get update -qq
+    msg_ok "Package list updated"
+
+    # Cài dependencies cần thiết
+    msg_info "Cài dependencies..."
+    $STD apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        gnupg \
+        lsb-release \
+        iproute2 \
+        iptables \
+        procps
+    msg_ok "Dependencies installed"
+
+    # Set hostname
+    if [[ -n "$TS_HOSTNAME" ]]; then
+        hostnamectl set-hostname "$TS_HOSTNAME" 2>/dev/null || \
+            echo "$TS_HOSTNAME" > /etc/hostname
+        msg_ok "Hostname: ${TS_HOSTNAME}"
+    fi
+}
+
+# =============================================================================
+# STEP 2 — Cài đặt Tailscale
+# =============================================================================
+_step2_install_tailscale() {
+    msg_section "Cài đặt Tailscale"
+
+    # Kiểm tra đã cài chưa
+    if command -v tailscale &>/dev/null; then
+        local current_ver
+        current_ver=$(tailscale version 2>/dev/null | head -1)
+        msg_info "Tailscale đã có: ${current_ver} — bỏ qua cài đặt"
+        return 0
+    fi
+
+    # Thêm GPG key
+    msg_info "Thêm Tailscale GPG key..."
+    $STD curl -fsSL "https://pkgs.tailscale.com/stable/debian/${OS_CODENAME}.noarmor.gpg" \
+        | tee "$TS_APT_KEY" > /dev/null
+    msg_ok "GPG key added"
+
+    # Thêm apt repository
+    msg_info "Thêm Tailscale apt repository..."
+    $STD curl -fsSL \
+        "https://pkgs.tailscale.com/stable/debian/${OS_CODENAME}.tailscale-keyring.list" \
+        | tee "$TS_APT_LIST" > /dev/null
+    msg_ok "Repository added: ${TS_APT_LIST}"
+
+    # Install
+    msg_info "Cài tailscale package..."
+    $STD apt-get update -qq
+    $STD apt-get install -y tailscale
+    msg_ok "Tailscale installed: $(tailscale version | head -1)"
+}
+
+# =============================================================================
+# STEP 3 — Cấu hình hệ thống
+# =============================================================================
+_step3_configure_system() {
+    msg_section "Cấu hình hệ thống"
+
+    # ip_forward — cần cho Subnet Router và Exit Node
+    if [[ "$ENABLE_SUBNET" == "1" ]] || [[ "$ENABLE_EXITNODE" == "1" ]]; then
+        msg_info "Enable ip_forward (cần cho Subnet Router/Exit Node)..."
+        cat > "$TS_SYSCTL_CONF" <<EOF
+# Tailscale — ip_forward
+# Generated by tailscale-proxmox installer
+net.ipv4.ip_forward          = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+        sysctl -p "$TS_SYSCTL_CONF" &>/dev/null
+        msg_ok "ip_forward: enabled"
+    else
+        msg_info "ip_forward: không cần (Simple mode)"
+    fi
+
+    # iptables — cho phép Tailscale forward traffic
+    if [[ "$ENABLE_SUBNET" == "1" ]] || [[ "$ENABLE_EXITNODE" == "1" ]]; then
+        msg_info "Cấu hình iptables cho forwarding..."
+        # Accept forwarded traffic qua Tailscale interface
+        iptables -I FORWARD -i tailscale0 -j ACCEPT 2>/dev/null || true
+        iptables -I FORWARD -o tailscale0 -j ACCEPT 2>/dev/null || true
+        # Masquerade traffic ra ngoài
+        iptables -t nat -I POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || true
+
+        # Lưu iptables rules để persist sau reboot
+        if command -v iptables-save &>/dev/null; then
+            mkdir -p /etc/iptables
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
+
+        # Cài iptables-persistent nếu chưa có
+        if ! dpkg -l iptables-persistent &>/dev/null; then
+            echo iptables-persistent iptables-persistent/autosave_v4 \
+                boolean true | debconf-set-selections
+            $STD apt-get install -y iptables-persistent
+        fi
+        msg_ok "iptables configured"
+    fi
+}
+
+# =============================================================================
+# STEP 4 — Start Tailscale service
+# =============================================================================
+_step4_start_service() {
+    msg_section "Khởi động Tailscale service"
+
+    # Enable và start tailscaled
+    msg_info "Enable tailscaled service..."
+    $STD systemctl enable tailscaled
+    $STD systemctl start tailscaled
+
+    # Chờ service ready
+    local max_wait=15
+    local elapsed=0
+    while (( elapsed < max_wait )); do
+        if systemctl is-active --quiet tailscaled; then
+            msg_ok "tailscaled service: running"
+            return 0
+        fi
+        sleep 1
+        (( elapsed++ ))
+    done
+
+    # Service chưa lên
+    msg_error "tailscaled không start được sau ${max_wait}s"
+    msg_plain  "Kiểm tra: journalctl -u tailscaled -n 50"
+    return 1
+}
+
+# =============================================================================
+# STEP 5 — Authenticate và cấu hình Tailscale
+# =============================================================================
+_step5_configure_tailscale() {
+    msg_section "Cấu hình Tailscale"
+
+    # Build tailscale up arguments
+    local up_args=()
+
+    # Subnet Router
+    if [[ "$ENABLE_SUBNET" == "1" ]] && [[ -n "$SUBNET_ROUTES" ]]; then
+        up_args+=("--advertise-routes=${SUBNET_ROUTES}")
+        msg_info "Subnet routes: ${SUBNET_ROUTES}"
+    fi
+
+    # Exit Node
+    if [[ "$ENABLE_EXITNODE" == "1" ]]; then
+        up_args+=("--advertise-exit-node")
+        msg_info "Exit Node: enabled"
+    fi
+
+    # Tailscale SSH
+    if [[ "$ENABLE_SSH" == "1" ]]; then
+        up_args+=("--ssh")
+        msg_info "Tailscale SSH: enabled"
+    fi
+
+    # Hostname
+    if [[ -n "$TS_HOSTNAME" ]]; then
+        up_args+=("--hostname=${TS_HOSTNAME}")
+    fi
+
+    # Auth với key nếu có
+    if [[ -n "$TS_AUTHKEY" ]]; then
+        msg_info "Authenticating với auth key..."
+        up_args+=("--authkey=${TS_AUTHKEY}")
+
+        if tailscale up "${up_args[@]}" 2>/dev/null; then
+            msg_ok "Authenticated thành công!"
+            _verify_auth
+        else
+            msg_error "Auth key thất bại — có thể key đã hết hạn hoặc sai"
+            msg_plain  "Auth thủ công sau: tailscale up"
+        fi
+    else
+        # Không có auth key — up nhưng không auth
+        up_args+=("--accept-routes")
+        msg_info "Khởi động Tailscale (chưa auth)..."
+
+        # tailscale up sẽ in URL để user authenticate
+        tailscale up "${up_args[@]}" --reset 2>/dev/null || true
+        msg_info "Cần authenticate thủ công — xem hướng dẫn ở cuối"
+    fi
+}
+
+# Verify kết nối sau auth
+_verify_auth() {
+    local max_wait=20
+    local elapsed=0
+
+    msg_info "Kiểm tra kết nối tailnet..."
+    while (( elapsed < max_wait )); do
+        local status
+        status=$(tailscale status 2>/dev/null | head -1)
+
+        if tailscale status &>/dev/null 2>&1; then
+            local ts_ip
+            ts_ip=$(tailscale ip 2>/dev/null | head -1)
+            local ts_ver
+            ts_ver=$(tailscale version | head -1)
+
+            msg_ok "Tailscale connected!"
+            msg_plain "Tailscale IP  : ${ts_ip}"
+            msg_plain "Version       : ${ts_ver}"
+
+            # Detect DERP relay đang dùng
+            local derp_region
+            derp_region=$(tailscale netcheck 2>/dev/null \
+                | grep -i "preferred DERP" \
+                | awk '{print $NF}' || echo "unknown")
+            msg_plain "DERP region   : ${derp_region}"
+
+            return 0
+        fi
+
+        sleep 1
+        (( elapsed++ ))
+    done
+
+    msg_warn "Tailscale chưa kết nối được sau ${max_wait}s"
+    msg_plain "Kiểm tra: tailscale status"
+}
+
+# =============================================================================
+# STEP 6 — Hardening & cleanup
+# =============================================================================
+_step6_hardening() {
+    msg_section "Hardening & Cleanup"
+
+    # Tắt password auth SSH (nếu sshd có) — dùng Tailscale SSH thay thế
+    if [[ "$ENABLE_SSH" == "1" ]] && [[ -f /etc/ssh/sshd_config ]]; then
+        sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' \
+            /etc/ssh/sshd_config 2>/dev/null || true
+        systemctl reload sshd 2>/dev/null || true
+        msg_ok "SSH password auth: disabled (dùng Tailscale SSH)"
+    fi
+
+    # Tắt root login trực tiếp
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' \
+            /etc/ssh/sshd_config 2>/dev/null || true
+    fi
+
+    # Cleanup apt cache
+    msg_info "Cleanup..."
+    $STD apt-get clean
+    $STD apt-get autoremove -y
+    rm -rf /var/lib/apt/lists/*
+    msg_ok "Cleanup done"
+
+    # Ghi thông tin cài đặt
+    mkdir -p /etc/tailscale-proxmox
+    cat > /etc/tailscale-proxmox/install-info <<EOF
+# Tailscale Install Info
+# Generated: $(date '+%Y-%m-%d %H:%M:%S')
+INSTALL_MODE="${INSTALL_MODE}"
+ENABLE_SUBNET="${ENABLE_SUBNET}"
+ENABLE_EXITNODE="${ENABLE_EXITNODE}"
+ENABLE_SSH="${ENABLE_SSH}"
+SUBNET_ROUTES="${SUBNET_ROUTES}"
+HOSTNAME="${TS_HOSTNAME}"
+TAILSCALE_VERSION="$(tailscale version 2>/dev/null | head -1)"
+EOF
+    msg_ok "Install info: /etc/tailscale-proxmox/install-info"
+}
+
+# =============================================================================
+# STEP 7 — Final summary trong LXC
+# =============================================================================
+_step7_summary() {
+    local ts_ip ts_ver conn_status
+
+    ts_ip=$(tailscale ip 2>/dev/null | head -1 || echo "chưa auth")
+    ts_ver=$(tailscale version 2>/dev/null | head -1 || echo "unknown")
+    conn_status=$(tailscale status 2>/dev/null | head -1 || echo "not connected")
+
+    echo ""
+    print_summary "Tailscale LXC — Cài đặt hoàn tất" \
+        "Version"      "${ts_ver}" \
+        "Tailscale IP" "${ts_ip}" \
+        "Mode"         "${INSTALL_MODE}" \
+        "Subnet Router" "$([[ $ENABLE_SUBNET   == 1 ]] && echo "ON: ${SUBNET_ROUTES}" || echo "OFF")" \
+        "Exit Node"    "$([[ $ENABLE_EXITNODE  == 1 ]] && echo "ON" || echo "OFF")" \
+        "TS SSH"       "$([[ $ENABLE_SSH       == 1 ]] && echo "ON" || echo "OFF")" \
+        "Log"          "$(get_log_file)"
+
+    # Hiển thị hướng dẫn nếu chưa auth
+    if [[ -z "$TS_AUTHKEY" ]]; then
+        echo ""
+        echo -e "  ${C_WARN}${BLD}══ AUTH THỦ CÔNG — CẦN THỰC HIỆN NGAY ══${CL}"
+        echo ""
+        echo -e "  Chạy lệnh sau trong LXC này:"
+        echo ""
+
+        local up_cmd="  tailscale up"
+        [[ "$ENABLE_SUBNET"   == "1" ]] && [[ -n "$SUBNET_ROUTES" ]] && \
+            up_cmd+=" \\\n    --advertise-routes=${SUBNET_ROUTES}"
+        [[ "$ENABLE_EXITNODE" == "1" ]] && \
+            up_cmd+=" \\\n    --advertise-exit-node"
+        [[ "$ENABLE_SSH"      == "1" ]] && \
+            up_cmd+=" \\\n    --ssh"
+        up_cmd+=" \\\n    --accept-routes"
+
+        echo -e "  ${C_INFO}${up_cmd}${CL}"
+        echo ""
+        echo -e "  Sau đó mở link hiện ra trên browser để đăng nhập."
+        echo ""
+        echo -e "  ${C_DIM}Tạo auth key tại:${CL}"
+        echo -e "  ${C_INFO}https://login.tailscale.com/admin/settings/keys${CL}"
+        echo ""
+    fi
+
+    # Advanced mode notes
+    if [[ "$INSTALL_MODE" == "advanced" ]]; then
+        if [[ "$ENABLE_SUBNET" == "1" ]] || [[ "$ENABLE_EXITNODE" == "1" ]]; then
+            echo ""
+            echo -e "  ${C_WARN}${BLD}Lưu ý cho Admin Tailscale:${CL}"
+            [[ "$ENABLE_SUBNET"   == "1" ]] && \
+                echo -e "  ${C_INFO}□${CL} Approve subnet route tại admin console"
+            [[ "$ENABLE_EXITNODE" == "1" ]] && \
+                echo -e "  ${C_INFO}□${CL} Approve exit node tại admin console"
+            echo -e "  ${C_INFO}→${CL} https://login.tailscale.com/admin/machines"
+        fi
+    fi
+
+    echo ""
+    msg_ok "tailscale-install.sh hoàn tất!"
+    log_summary
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+main() {
+    header_info "Tailscale" "LXC Installer"
+
+    echo -e "  ${C_DIM}Mode     : ${INSTALL_MODE}${CL}"
+    echo -e "  ${C_DIM}Subnet   : ${ENABLE_SUBNET}${CL}"
+    echo -e "  ${C_DIM}ExitNode : ${ENABLE_EXITNODE}${CL}"
+    echo -e "  ${C_DIM}SSH      : ${ENABLE_SSH}${CL}"
+    echo -e "  ${C_DIM}Log      : $(get_log_file)${CL}"
+    echo ""
+
+    _step0_verify_environment   # Kiểm tra LXC, OS, TUN, internet
+    _step1_prepare_system       # apt update, dependencies, hostname
+    _step2_install_tailscale    # Thêm repo + cài package
+    _step3_configure_system     # ip_forward, iptables nếu cần
+    _step4_start_service        # systemctl enable + start
+    _step5_configure_tailscale  # tailscale up + auth
+    _step6_hardening            # SSH hardening + cleanup
+    _step7_summary              # In kết quả cuối
+}
+
+main "$@"
