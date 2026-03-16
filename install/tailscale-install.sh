@@ -342,8 +342,9 @@ _auth_interactive() {
         local tmp_out
         tmp_out=$(mktemp /tmp/ts-auth-XXXXXX)
 
-        # Chạy tailscale up background, capture cả stdout+stderr
-        tailscale up "${up_args[@]}" --reset > "$tmp_out" 2>&1 &
+        # Chạy tailscale up background CHỈ để lấy URL
+        # Không dùng --reset để tránh reset auth state khi user đang login
+        tailscale up "${up_args[@]}" > "$tmp_out" 2>&1 &
         local ts_pid=$!
 
         # Poll file chờ URL xuất hiện (tối đa url_poll_timeout giây)
@@ -356,7 +357,12 @@ _auth_interactive() {
             (( elapsed++ )) || true
         done
 
-        # ── Hiển thị URL ──────────────────────────────────────────────────────
+        # QUAN TRỌNG: Kill background process ngay sau khi có URL
+        # tailscale up --reset đang chạy background sẽ reset auth state
+        # khi user đang authenticate → phải kill trước khi user login!
+        kill "$ts_pid" 2>/dev/null || true
+        wait "$ts_pid" 2>/dev/null || true
+        rm -f "$tmp_out"
         echo ""
         echo -e "  ${BLD}${CY}╔══════════════════════════════════════════════╗${CL}"
         echo -e "  ${BLD}${CY}║  🔐  XÁC THỰC TAILSCALE                     ║${CL}"
@@ -372,8 +378,6 @@ _auth_interactive() {
             echo ""
             log_write "AUTH_URL" "${auth_url}"
         else
-            kill "$ts_pid" 2>/dev/null || true
-            rm -f "$tmp_out"
             msg_warn "Không lấy được URL tự động"
             msg_plain "Chạy thủ công: tailscale up"
             _auth_show_manual_cmd "${up_args[@]}"
@@ -384,43 +388,41 @@ _auth_interactive() {
         # ── Chờ auth thành công với countdown ────────────────────────────────
         local auth_done=false
         local wait_elapsed=0
-        local last_countdown=-1
 
         while (( wait_elapsed < auth_wait_timeout )); do
-            # Kiểm tra auth thành công
-            if tailscale status &>/dev/null 2>&1; then
-                local ts_state
-                ts_state=$(tailscale status --json 2>/dev/null \
-                    | grep -o '"BackendState":"[^"]*"' \
-                    | cut -d'"' -f4 || echo "")
-                if [[ "$ts_state" == "Running" ]]; then
-                    auth_done=true
-                    break
-                fi
+
+            # Kiểm tra auth — dùng tailscale status --json để detect chính xác
+            # BackendState="Running" = đã auth và connected
+            # BackendState="NeedsLogin" = chưa auth
+            # BackendState="Starting" = đang kết nối
+            local ts_state
+            ts_state=$(tailscale status --json 2>/dev/null \
+                | grep -o '"BackendState":"[^"]*"' \
+                | cut -d'"' -f4 2>/dev/null || echo "")
+
+            if [[ "$ts_state" == "Running" ]]; then
+                auth_done=true
+                break
             fi
 
-            # Countdown mỗi 30 giây
+            # Countdown cập nhật mỗi 5 giây — user thấy script đang chạy
             local remaining=$(( auth_wait_timeout - wait_elapsed ))
-            local countdown_mark=$(( remaining / 30 ))
-            if (( countdown_mark != last_countdown )); then
-                last_countdown=$countdown_mark
-                if (( remaining <= 60 )); then
-                    printf "\r  ${C_WARN}⏱  Còn %ds...${CL}  " "$remaining"
-                elif (( remaining <= 120 )); then
-                    printf "\r  ${C_DIM}⏱  Còn %ds...${CL}  " "$remaining"
-                fi
+            local mins=$(( remaining / 60 ))
+            local secs=$(( remaining % 60 ))
+
+            if (( mins > 0 )); then
+                printf "\r  ${C_DIM}⏱  Chờ auth... còn %dm%ds  [%s]${CL}  " \
+                    "$mins" "$secs" "${ts_state:-unknown}"
+            else
+                printf "\r  ${C_WARN}⏱  Chờ auth... còn %ds  [%s]${CL}  " \
+                    "$secs" "${ts_state:-unknown}"
             fi
 
-            sleep 2
-            (( wait_elapsed += 2 )) || true
+            sleep 3
+            (( wait_elapsed += 3 )) || true
         done
 
-        printf "\r%*s\r" "60" ""   # Clear countdown line
-
-        # Cleanup background process
-        kill "$ts_pid" 2>/dev/null || true
-        wait "$ts_pid" 2>/dev/null || true
-        rm -f "$tmp_out"
+        printf "\r%60s\r" ""   # Clear countdown line
 
         # ── Xử lý kết quả ────────────────────────────────────────────────────
         if $auth_done; then
