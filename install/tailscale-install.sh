@@ -140,17 +140,51 @@ _step2_install_tailscale() {
         return 0
     fi
 
-    # Thêm GPG key
+    # Detect đúng distro cho Tailscale repo URL
+    # Ubuntu và Debian có URL khác nhau:
+    #   https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg
+    #   https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg
+    local ts_distro
+    case "$OS_ID" in
+        ubuntu)  ts_distro="ubuntu" ;;
+        debian)  ts_distro="debian" ;;
+        raspbian) ts_distro="debian" ;;
+        *)       ts_distro="debian" ;;  # fallback
+    esac
+
+    local ts_base_url="https://pkgs.tailscale.com/stable/${ts_distro}/${OS_CODENAME}"
+
+    msg_info "Distro: ${ts_distro} ${OS_CODENAME}"
+
+    # Thêm GPG key — dùng -sL không -f (tránh exit 22 khi redirect)
     msg_info "Thêm Tailscale GPG key..."
-    $STD curl -fsSL "https://pkgs.tailscale.com/stable/debian/${OS_CODENAME}.noarmor.gpg" \
-        | tee "$TS_APT_KEY" > /dev/null
-    msg_ok "GPG key added"
+    local gpg_url="${ts_base_url}.noarmor.gpg"
+    if ! curl -sL --max-time 30 "$gpg_url" \
+        | tee "$TS_APT_KEY" > /dev/null; then
+        msg_error "Không download được GPG key: ${gpg_url}"
+        msg_plain  "Kiểm tra URL: curl -I ${gpg_url}"
+        exit 1
+    fi
+
+    # Verify key hợp lệ (file binary, không phải HTML error)
+    if ! file "$TS_APT_KEY" 2>/dev/null | grep -qi "PGP\|GPG\|data"; then
+        # Thử đọc nội dung xem có phải error page không
+        if grep -qi "not found\|error\|404" "$TS_APT_KEY" 2>/dev/null; then
+            msg_error "GPG key URL không hợp lệ: ${gpg_url}"
+            msg_plain  "OS_CODENAME='${OS_CODENAME}' có thể không đúng"
+            exit 1
+        fi
+    fi
+    msg_ok "GPG key added: ${TS_APT_KEY}"
 
     # Thêm apt repository
     msg_info "Thêm Tailscale apt repository..."
-    $STD curl -fsSL \
-        "https://pkgs.tailscale.com/stable/debian/${OS_CODENAME}.tailscale-keyring.list" \
-        | tee "$TS_APT_LIST" > /dev/null
+    local list_url="${ts_base_url}.tailscale-keyring.list"
+    if ! curl -sL --max-time 30 "$list_url" \
+        | tee "$TS_APT_LIST" > /dev/null; then
+        msg_error "Không download được apt list: ${list_url}"
+        exit 1
+    fi
     msg_ok "Repository added: ${TS_APT_LIST}"
 
     # Install
@@ -439,7 +473,7 @@ _step7_summary() {
 # MAIN
 # =============================================================================
 main() {
-    header_info "Tailscale" "LXC Installer"
+    header_info "Tailscale Install"
 
     echo -e "  ${C_DIM}Mode     : ${INSTALL_MODE}${CL}"
     echo -e "  ${C_DIM}Subnet   : ${ENABLE_SUBNET}${CL}"
