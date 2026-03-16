@@ -581,7 +581,7 @@ _verify_auth() {
 
         if tailscale status &>/dev/null 2>&1; then
             local ts_ip
-            ts_ip=$(tailscale ip 2>/dev/null | head -1)
+            ts_ip=$(tailscale ip -4 2>/dev/null)
             local ts_ver
             ts_ver=$(tailscale version | head -1)
 
@@ -656,7 +656,7 @@ EOF
 _step7_summary() {
     local ts_ip ts_ver conn_status
 
-    ts_ip=$(tailscale ip 2>/dev/null | head -1 || echo "chưa auth")
+    ts_ip=$(tailscale ip -4 2>/dev/null || echo "chưa auth")
     ts_ver=$(tailscale version 2>/dev/null | head -1 || echo "unknown")
     conn_status=$(tailscale status 2>/dev/null | head -1 || echo "not connected")
 
