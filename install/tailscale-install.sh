@@ -342,8 +342,9 @@ _auth_interactive() {
         local tmp_out
         tmp_out=$(mktemp /tmp/ts-auth-XXXXXX)
 
-        # Chạy tailscale up background CHỈ để lấy URL
-        # Không dùng --reset để tránh reset auth state khi user đang login
+        # Chạy tailscale up background để lấy URL
+        # KHÔNG dùng --reset: chỉ cần URL, không reset state
+        # KHÔNG kill sau khi lấy URL: để tailscaled tự handle auth flow
         tailscale up "${up_args[@]}" > "$tmp_out" 2>&1 &
         local ts_pid=$!
 
@@ -356,13 +357,6 @@ _auth_interactive() {
             sleep 1
             (( elapsed++ )) || true
         done
-
-        # QUAN TRỌNG: Kill background process ngay sau khi có URL
-        # tailscale up --reset đang chạy background sẽ reset auth state
-        # khi user đang authenticate → phải kill trước khi user login!
-        kill "$ts_pid" 2>/dev/null || true
-        wait "$ts_pid" 2>/dev/null || true
-        rm -f "$tmp_out"
         echo ""
         echo -e "  ${BLD}${CY}╔══════════════════════════════════════════════╗${CL}"
         echo -e "  ${BLD}${CY}║  🔐  XÁC THỰC TAILSCALE                     ║${CL}"
@@ -391,31 +385,35 @@ _auth_interactive() {
 
         while (( wait_elapsed < auth_wait_timeout )); do
 
-            # Kiểm tra auth — dùng tailscale status --json để detect chính xác
-            # BackendState="Running" = đã auth và connected
-            # BackendState="NeedsLogin" = chưa auth
-            # BackendState="Starting" = đang kết nối
-            local ts_state
-            ts_state=$(tailscale status --json 2>/dev/null \
-                | grep -o '"BackendState":"[^"]*"' \
-                | cut -d'"' -f4 2>/dev/null || echo "")
+            # Cách đơn giản nhất: tailscale ip -4 trả về IP khi đã auth
+            # Trả về empty/error khi chưa auth → không cần parse JSON
+            local ts_ip
+            ts_ip=$(tailscale ip -4 2>/dev/null || true)
 
-            if [[ "$ts_state" == "Running" ]]; then
+            if [[ -n "$ts_ip" ]] && [[ "$ts_ip" =~ ^100\. ]]; then
                 auth_done=true
                 break
             fi
 
-            # Countdown cập nhật mỗi 5 giây — user thấy script đang chạy
+            # Lấy trạng thái hiện tại để hiển thị
+            local ts_state
+            ts_state=$(tailscale status 2>/dev/null | head -1 \
+                | grep -oP '(?<=Status: )\w+' || \
+                tailscale status --json 2>/dev/null \
+                | grep -o '"BackendState":"[^"]*"' \
+                | cut -d'"' -f4 2>/dev/null || echo "connecting")
+
+            # Countdown cập nhật mỗi 3 giây
             local remaining=$(( auth_wait_timeout - wait_elapsed ))
             local mins=$(( remaining / 60 ))
             local secs=$(( remaining % 60 ))
 
             if (( mins > 0 )); then
-                printf "\r  ${C_DIM}⏱  Chờ auth... còn %dm%ds  [%s]${CL}  " \
-                    "$mins" "$secs" "${ts_state:-unknown}"
+                printf "\r  ${C_DIM}⏱  Chờ auth... còn %dm%ds  [%s]${CL}     " \
+                    "$mins" "$secs" "${ts_state:-waiting}"
             else
-                printf "\r  ${C_WARN}⏱  Chờ auth... còn %ds  [%s]${CL}  " \
-                    "$secs" "${ts_state:-unknown}"
+                printf "\r  ${C_WARN}⏱  Chờ auth... còn %ds  [%s]${CL}     " \
+                    "$secs" "${ts_state:-waiting}"
             fi
 
             sleep 3
@@ -423,6 +421,11 @@ _auth_interactive() {
         done
 
         printf "\r%60s\r" ""   # Clear countdown line
+
+        # Cleanup background process
+        kill "$ts_pid" 2>/dev/null || true
+        wait "$ts_pid" 2>/dev/null || true
+        rm -f "$tmp_out"
 
         # ── Xử lý kết quả ────────────────────────────────────────────────────
         if $auth_done; then
@@ -578,26 +581,26 @@ _verify_auth() {
 
     msg_info "Kiểm tra kết nối tailnet..."
     while (( elapsed < max_wait )); do
-        local status
-        status=$(tailscale status 2>/dev/null | head -1)
+        local ts_ip
+        ts_ip=$(tailscale ip -4 2>/dev/null || true)
 
-        if tailscale status &>/dev/null 2>&1; then
-            local ts_ip
-            ts_ip=$(tailscale ip -4 2>/dev/null)
+        if [[ -n "$ts_ip" ]] && [[ "$ts_ip" =~ ^100\. ]]; then
             local ts_ver
-            ts_ver=$(tailscale version | head -1)
-
-            msg_ok "Tailscale connected!"
-            msg_plain "Tailscale IP  : ${ts_ip}"
-            msg_plain "Version       : ${ts_ver}"
-
-            # Detect DERP relay đang dùng
+            ts_ver=$(tailscale version 2>/dev/null | head -1)
+            local ts_hostname
+            ts_hostname=$(tailscale status 2>/dev/null \
+                | awk 'NR==2{print $2}' || echo "")
             local derp_region
             derp_region=$(tailscale netcheck 2>/dev/null \
                 | grep -i "preferred DERP" \
                 | awk '{print $NF}' || echo "unknown")
-            msg_plain "DERP region   : ${derp_region}"
 
+            echo ""
+            msg_ok "Tailscale connected!"
+            msg_plain "Tailscale IP  : ${ts_ip}"
+            msg_plain "Hostname      : ${ts_hostname:-$(hostname)}"
+            msg_plain "Version       : ${ts_ver}"
+            msg_plain "DERP region   : ${derp_region}"
             return 0
         fi
 
