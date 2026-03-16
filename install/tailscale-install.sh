@@ -306,22 +306,267 @@ _step5_configure_tailscale() {
         msg_info "Authenticating với auth key..."
         up_args+=("--authkey=${TS_AUTHKEY}")
 
-        if tailscale up "${up_args[@]}" 2>/dev/null; then
+        if tailscale up "${up_args[@]}" 2>&1; then
             msg_ok "Authenticated thành công!"
             _verify_auth
         else
             msg_error "Auth key thất bại — có thể key đã hết hạn hoặc sai"
-            msg_plain  "Auth thủ công sau: tailscale up"
+            msg_plain  "Auth thủ công: tailscale up"
         fi
     else
-        # Không có auth key — up nhưng không auth
+        # Không có auth key → interactive auth với retry
         up_args+=("--accept-routes")
-        msg_info "Khởi động Tailscale (chưa auth)..."
-
-        # tailscale up sẽ in URL để user authenticate
-        tailscale up "${up_args[@]}" --reset 2>/dev/null || true
-        msg_info "Cần authenticate thủ công — xem hướng dẫn ở cuối"
+        _auth_interactive "${up_args[@]}"
     fi
+}
+
+# ── Interactive auth với timeout + retry + rollback ───────────────────────────
+_auth_interactive() {
+    local up_args=("$@")
+
+    local max_retries=3
+    local url_poll_timeout=15       # giây chờ URL xuất hiện
+    local auth_wait_timeout=300     # 5 phút chờ user auth
+    local attempt=0
+
+    while (( attempt < max_retries )); do
+        (( attempt++ ))
+
+        echo ""
+        if (( attempt > 1 )); then
+            msg_info "Retry lần ${attempt}/${max_retries}..."
+        fi
+
+        # ── Lấy auth URL ──────────────────────────────────────────────────────
+        local auth_url=""
+        local tmp_out
+        tmp_out=$(mktemp /tmp/ts-auth-XXXXXX)
+
+        # Chạy tailscale up background, capture cả stdout+stderr
+        tailscale up "${up_args[@]}" --reset > "$tmp_out" 2>&1 &
+        local ts_pid=$!
+
+        # Poll file chờ URL xuất hiện (tối đa url_poll_timeout giây)
+        local elapsed=0
+        while (( elapsed < url_poll_timeout )); do
+            auth_url=$(grep -oP 'https://login\.tailscale\.com/a/\S+' \
+                "$tmp_out" 2>/dev/null | head -1 || true)
+            [[ -n "$auth_url" ]] && break
+            sleep 1
+            (( elapsed++ ))
+        done
+
+        # ── Hiển thị URL ──────────────────────────────────────────────────────
+        echo ""
+        echo -e "  ${BLD}${CY}╔══════════════════════════════════════════════╗${CL}"
+        echo -e "  ${BLD}${CY}║  🔐  XÁC THỰC TAILSCALE                     ║${CL}"
+        echo -e "  ${BLD}${CY}╚══════════════════════════════════════════════╝${CL}"
+        echo ""
+
+        if [[ -n "$auth_url" ]]; then
+            echo -e "  ${C_WARN}${BLD}Mở URL sau trên browser để đăng nhập:${CL}"
+            echo ""
+            echo -e "  ${C_INFO}${BLD}${auth_url}${CL}"
+            echo ""
+            echo -e "  ${C_DIM}Timeout: ${auth_wait_timeout}s — Script tự tiếp tục sau khi bạn đăng nhập${CL}"
+            echo ""
+            log_write "AUTH_URL" "${auth_url}"
+        else
+            kill "$ts_pid" 2>/dev/null || true
+            rm -f "$tmp_out"
+            msg_warn "Không lấy được URL tự động"
+            msg_plain "Chạy thủ công: tailscale up"
+            _auth_show_manual_cmd "${up_args[@]}"
+            _auth_skip_handler
+            return
+        fi
+
+        # ── Chờ auth thành công với countdown ────────────────────────────────
+        local auth_done=false
+        local wait_elapsed=0
+        local last_countdown=-1
+
+        while (( wait_elapsed < auth_wait_timeout )); do
+            # Kiểm tra auth thành công
+            if tailscale status &>/dev/null 2>&1; then
+                local ts_state
+                ts_state=$(tailscale status --json 2>/dev/null \
+                    | grep -o '"BackendState":"[^"]*"' \
+                    | cut -d'"' -f4 || echo "")
+                if [[ "$ts_state" == "Running" ]]; then
+                    auth_done=true
+                    break
+                fi
+            fi
+
+            # Countdown mỗi 30 giây
+            local remaining=$(( auth_wait_timeout - wait_elapsed ))
+            local countdown_mark=$(( remaining / 30 ))
+            if (( countdown_mark != last_countdown )); then
+                last_countdown=$countdown_mark
+                if (( remaining <= 60 )); then
+                    printf "\r  ${C_WARN}⏱  Còn %ds...${CL}  " "$remaining"
+                elif (( remaining <= 120 )); then
+                    printf "\r  ${C_DIM}⏱  Còn %ds...${CL}  " "$remaining"
+                fi
+            fi
+
+            sleep 2
+            (( wait_elapsed += 2 ))
+        done
+
+        printf "\r%*s\r" "60" ""   # Clear countdown line
+
+        # Cleanup background process
+        kill "$ts_pid" 2>/dev/null || true
+        wait "$ts_pid" 2>/dev/null || true
+        rm -f "$tmp_out"
+
+        # ── Xử lý kết quả ────────────────────────────────────────────────────
+        if $auth_done; then
+            echo ""
+            msg_ok "Xác thực thành công!"
+            _verify_auth
+            return 0
+        fi
+
+        # Auth timeout — hỏi user
+        echo ""
+        local remaining_retries=$(( max_retries - attempt ))
+        _auth_timeout_menu "$attempt" "$max_retries" "$remaining_retries" \
+            "${up_args[@]}"
+        local menu_result=$?
+
+        case $menu_result in
+            0)  # Retry — tiếp tục loop
+                continue
+                ;;
+            1)  # Skip — cài xong không auth
+                _auth_skip_handler
+                return 0
+                ;;
+            2)  # Quit — rollback
+                _auth_quit_rollback
+                exit 0
+                ;;
+        esac
+
+    done
+
+    # Hết retry — auto skip
+    echo ""
+    msg_warn "Đã thử ${max_retries} lần nhưng không xác thực được"
+    _auth_skip_handler
+}
+
+# ── Hiển thị menu khi timeout ─────────────────────────────────────────────────
+_auth_timeout_menu() {
+    local attempt="$1"
+    local max="$2"
+    local remaining="$3"
+    shift 3
+
+    echo -e "  ${C_WARN}⏱  Timeout — Chưa xác thực được sau 5 phút${CL}"
+    echo ""
+
+    if (( remaining > 0 )); then
+        echo -e "  ${C_INFO}[R]${CL}  Retry — lấy URL mới ${C_DIM}(còn ${remaining} lần)${CL}"
+    else
+        echo -e "  ${C_DIM}[R]  Retry — không còn lần thử nào${CL}"
+    fi
+    echo -e "  ${C_INFO}[S]${CL}  Skip  — hoàn tất cài đặt, auth thủ công sau"
+    echo -e "  ${C_INFO}[Q]${CL}  Quit  — thoát và rollback cấu hình"
+    echo ""
+
+    while true; do
+        echo -en "  ${C_WARN}?${CL}  Lựa chọn [$(( remaining > 0 ))R/S/Q]: "
+        read -r choice
+        case "${choice^^}" in
+            R)
+                if (( remaining > 0 )); then
+                    log_write "AUTH" "User chọn Retry (lần ${attempt}/${max})"
+                    return 0
+                else
+                    msg_warn "Không còn lần retry — chọn S hoặc Q"
+                fi
+                ;;
+            S)
+                log_write "AUTH" "User chọn Skip auth"
+                return 1
+                ;;
+            Q)
+                log_write "AUTH" "User chọn Quit + rollback"
+                return 2
+                ;;
+            *)
+                msg_warn "Nhập R, S hoặc Q"
+                ;;
+        esac
+    done
+}
+
+# ── Skip: hoàn tất nhưng chưa auth ───────────────────────────────────────────
+_auth_skip_handler() {
+    local up_cmd="tailscale up --accept-routes"
+    [[ "$ENABLE_SUBNET"   == "1" ]] && \
+        up_cmd+=" --advertise-routes=${SUBNET_ROUTES}"
+    [[ "$ENABLE_EXITNODE" == "1" ]] && \
+        up_cmd+=" --advertise-exit-node"
+    [[ "$ENABLE_SSH"      == "1" ]] && \
+        up_cmd+=" --ssh"
+
+    echo ""
+    echo -e "  ${C_WARN}${BLD}Tailscale đã cài — cần auth để hoạt động${CL}"
+    echo ""
+    echo -e "  Chạy lệnh sau bất cứ lúc nào để auth:"
+    echo ""
+    echo -e "  ${C_INFO}${up_cmd}${CL}"
+    echo ""
+    echo -e "  ${C_DIM}Hoặc dùng auth key tại:${CL}"
+    echo -e "  ${C_INFO}https://login.tailscale.com/admin/settings/keys${CL}"
+    echo ""
+    log_write "AUTH_SKIP" "Tailscale installed but not authenticated. Manual cmd: ${up_cmd}"
+}
+
+# ── Quit + Rollback ───────────────────────────────────────────────────────────
+_auth_quit_rollback() {
+    echo ""
+    msg_info "Đang rollback cấu hình Tailscale..."
+
+    # Stop và disable service
+    systemctl stop tailscaled 2>/dev/null || true
+    systemctl disable tailscaled 2>/dev/null || true
+    msg_ok "Service stopped"
+
+    # Xóa state files (giữ lại package để có thể dùng lại)
+    rm -rf /var/lib/tailscale 2>/dev/null || true
+    rm -f /etc/tailscale-proxmox/install-info 2>/dev/null || true
+    msg_ok "State files cleared"
+
+    # Xóa sysctl config nếu đã tạo
+    rm -f /etc/sysctl.d/99-tailscale.conf 2>/dev/null || true
+
+    echo ""
+    echo -e "  ${C_WARN}Rollback hoàn tất.${CL}"
+    echo -e "  ${C_DIM}Package Tailscale vẫn còn — chạy lại script khi sẵn sàng.${CL}"
+    echo ""
+    log_write "ROLLBACK" "User quit — state cleared, package retained"
+}
+
+# ── In lệnh auth thủ công ─────────────────────────────────────────────────────
+_auth_show_manual_cmd() {
+    local up_cmd="tailscale up --accept-routes"
+    [[ "$ENABLE_SUBNET"   == "1" ]] && \
+        up_cmd+=" --advertise-routes=${SUBNET_ROUTES}"
+    [[ "$ENABLE_EXITNODE" == "1" ]] && \
+        up_cmd+=" --advertise-exit-node"
+    [[ "$ENABLE_SSH"      == "1" ]] && \
+        up_cmd+=" --ssh"
+
+    echo ""
+    echo -e "  ${C_DIM}Lệnh auth thủ công:${CL}"
+    echo -e "  ${C_INFO}${up_cmd}${CL}"
+    echo ""
 }
 
 # Verify kết nối sau auth
